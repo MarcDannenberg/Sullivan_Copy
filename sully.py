@@ -630,7 +630,7 @@ class Sully:
         """
         self._track_module_access("identity")
         
-        if not hasattr(self.identity, 'adapt_to_context'):
+        if not self.identity or not hasattr(self.identity, 'adapt_to_context'):
             return {"success": False, "message": "Enhanced identity adaptation not available"}
         
         result = self.identity.adapt_to_context(context, context_data)
@@ -663,7 +663,7 @@ class Sully:
         """
         self._track_module_access("identity")
         
-        if not hasattr(self.identity, 'evolve_personality'):
+        if not self.identity or not hasattr(self.identity, 'evolve_personality'):
             return {"success": False, "message": "Enhanced identity evolution not available"}
         
         # If no interactions provided and memory available, try to retrieve
@@ -710,7 +710,7 @@ class Sully:
         """
         self._track_module_access("identity")
         
-        if not hasattr(self.identity, 'generate_dynamic_persona'):
+        if not self.identity or not hasattr(self.identity, 'generate_dynamic_persona'):
             return None, "Enhanced identity system not available"
         
         persona_id, description = self.identity.generate_dynamic_persona(
@@ -746,7 +746,7 @@ class Sully:
         """
         self._track_module_access("identity")
         
-        if not hasattr(self.identity, 'generate_personality_profile'):
+        if not self.identity or not hasattr(self.identity, 'generate_personality_profile'):
             return {"error": "Enhanced identity profile not available"}
         
         return self.identity.generate_personality_profile(detailed)
@@ -760,7 +760,7 @@ class Sully:
         """
         self._track_module_access("identity")
         
-        if not hasattr(self.identity, 'create_multilevel_identity_map'):
+        if not self.identity or not hasattr(self.identity, 'create_multilevel_identity_map'):
             return {"error": "Enhanced identity mapping not available"}
         
         return self.identity.create_multilevel_identity_map()
@@ -779,12 +779,15 @@ class Sully:
         """
         self._track_module_access("identity")
         
-        if not hasattr(self.identity, 'align_response'):
+        if not self.identity or not hasattr(self.identity, 'align_response'):
             return content
         
         # Use the current mode if none provided
         if not mode:
-            mode = self.identity.current_mode if hasattr(self.identity, 'current_mode') else "emergent"
+            current_mode = "emergent"
+            if self.identity and hasattr(self.identity, 'current_mode'):
+                current_mode = self.identity.current_mode
+            mode = current_mode
         
         # Transform the response
         return self.identity.align_response(content, mode, context_data)
@@ -808,6 +811,9 @@ class Sully:
         text = self._execute_hooks("before_reasoning", text)
         
         try:
+            if not self.judgment:
+                raise AttributeError("Judgment module not available")
+                
             result = self.judgment.evaluate(text, framework=framework, detailed_output=detailed_output)
             
             # Post-processing hook
@@ -850,6 +856,9 @@ class Sully:
         self._track_module_access("dream")
         
         try:
+            if not self.dream:
+                raise AttributeError("Dream module not available")
+                
             return self.dream.generate(seed, depth, style)
         except Exception as e:
             self.logger.error(f"Dream generation error: {str(e)}")
@@ -880,6 +889,9 @@ class Sully:
         self._track_module_access("translator")
         
         try:
+            if not self.translator:
+                raise AttributeError("Translator module not available")
+                
             return self.translator.translate(phrase, style, domain)
         except Exception as e:
             self.logger.error(f"Math translation error: {str(e)}")
@@ -908,6 +920,9 @@ class Sully:
         self._track_module_access("fusion")
         
         try:
+            if not self.fusion:
+                raise AttributeError("Fusion module not available")
+                
             return self.fusion.fuse(*inputs)
         except Exception as e:
             self.logger.error(f"Fusion error: {str(e)}")
@@ -937,6 +952,9 @@ class Sully:
         self._track_module_access("paradox")
         
         try:
+            if not self.paradox:
+                raise AttributeError("Paradox module not available")
+                
             return self.paradox.get(topic)
         except Exception as e:
             self.logger.error(f"Paradox exploration error: {str(e)}")
@@ -985,7 +1003,7 @@ class Sully:
             tone = "emergent"
         
         # If memory integration is enabled, use the integrated reasoning method
-        if self.memory_integration and hasattr(self.reasoning_node, 'reason_with_memory'):
+        if self.memory_integration and self.reasoning_node and hasattr(self.reasoning_node, 'reason_with_memory'):
             try:
                 result = self.reasoning_node.reason_with_memory(message, tone)
                 
@@ -1004,7 +1022,7 @@ class Sully:
     def _standard_reason(self, message, tone="emergent"):
         """Standard reasoning fallback method."""
         # Apply language processing enhancements if available
-        if hasattr(self, "language_processor"):
+        if hasattr(self, "language_processor") and self.language_processor:
             try:
                 # Analyze the message
                 analysis = self.language_processor.analyze_text(message)
@@ -1023,11 +1041,14 @@ class Sully:
                 self.logger.error(f"Language enhancement error: {str(e)}")
         
         try:
+            if not self.reasoning_node:
+                raise AttributeError("Reasoning node not available")
+                
             # Attempt standard reasoning with the requested tone
             result = self.reasoning_node.reason(message, tone)
             
             # Apply identity transformation if available
-            if hasattr(self.identity, 'align_response'):
+            if self.identity and hasattr(self.identity, 'align_response'):
                 result = self.identity.align_response(result, tone)
                 
             # Post-processing hook
@@ -1038,7 +1059,7 @@ class Sully:
             self.logger.error(f"Standard reasoning error with tone '{tone}': {str(e)}")
             
             # If specific tone fails, fall back to emergent reasoning
-            if tone != "emergent":
+            if tone != "emergent" and self.reasoning_node:
                 try:
                     return self.reasoning_node.reason(message, "emergent")
                 except Exception as emergent_e:
@@ -1105,10 +1126,10 @@ class Sully:
         self._track_module_access("conversation")
         
         # Try enhanced processing with language capabilities if available
-        if hasattr(self, "response_generator"):
+        if hasattr(self, "response_generator") and self.response_generator:
             try:
                 analysis = None
-                if hasattr(self, "language_processor"):
+                if hasattr(self, "language_processor") and self.language_processor:
                     analysis = self.language_processor.analyze_text(message)
                 
                 enhanced_response = self.response_generator.generate_response(message, context)
@@ -1121,7 +1142,7 @@ class Sully:
                 # Continue with standard processing
         
         # If memory integration is enabled, use conversation with memory
-        if self.memory_integration and hasattr(self.conversation, 'process_with_memory'):
+        if self.memory_integration and self.conversation and hasattr(self.conversation, 'process_with_memory'):
             try:
                 return self.conversation.process_with_memory(message)
             except Exception as e:
@@ -1202,7 +1223,7 @@ class Sully:
                 return f"[Unsupported file type: {ext}]"
             
             # Process with advanced content ingestion if available
-            if content and hasattr(self, "ingestion_kernel"):
+            if content and hasattr(self, "ingestion_kernel") and self.ingestion_kernel:
                 try:
                     # Determine content type
                     content_type = "document"
@@ -1308,7 +1329,7 @@ class Sully:
         """
         self._track_module_access("ingestion_kernel")
         
-        if not hasattr(self, "ingestion_kernel"):
+        if not hasattr(self, "ingestion_kernel") or not self.ingestion_kernel:
             return {"error": "Content ingestion kernel not available"}
         
         try:
@@ -1354,7 +1375,7 @@ class Sully:
         """
         self._track_module_access("language_processor")
         
-        if not hasattr(self, "language_processor"):
+        if not hasattr(self, "language_processor") or not self.language_processor:
             return {"error": "Language processor not available"}
         
         try:
@@ -1493,7 +1514,7 @@ class Sully:
     def _extract_key_concepts(self, text):
         """Extract key concepts from text content."""
         # Use language processor if available
-        if hasattr(self, "language_processor"):
+        if hasattr(self, "language_processor") and self.language_processor:
             try:
                 analysis = self.language_processor.analyze_text(text)
                 if "weighted_concepts" in analysis:
@@ -1655,8 +1676,8 @@ class Sully:
         # Use PDFReader's image extraction functionality
         if not self.pdf_reader:
             return "PDF processing capabilities are not available."
-            
-        try:
+
+       try:
             images_info = self.pdf_reader.extract_images(pdf_path, output_dir)
             
             if not images_info:
@@ -1676,7 +1697,7 @@ class Sully:
             self.logger.error(f"PDF image extraction error: {str(e)}")
             return f"Error extracting images: {str(e)}"
 
-def word_count(self):
+    def word_count(self):
         """Return the number of concepts in Sully's lexicon."""
         self._track_module_access("codex")
         
