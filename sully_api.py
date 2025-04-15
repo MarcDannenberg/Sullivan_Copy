@@ -10,6 +10,15 @@ import uuid
 from datetime import datetime, timedelta
 import asyncio
 from enum import Enum
+import logging
+import traceback
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 user_contexts = {}
 user_consents = {}
@@ -20,16 +29,27 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import Sully system
 try:
     from sully import Sully
-except ImportError:
+    logger.info("Successfully imported Sully module")
+except ImportError as e:
+    logger.warning(f"Failed to import Sully module: {str(e)}")
     # Define a minimal Sully class if import fails
     class Sully:
         def __init__(self):
+            logger.info("Initializing minimal Sully class")
             self.reasoning_node = None
             self.memory = None
             self.codex = None
 
 # Import games router
-from sully_engine.games_api import include_games_router
+try:
+    from sully_engine.games_api import include_games_router
+    logger.info("Successfully imported games router")
+except ImportError as e:
+    logger.warning(f"Failed to import games router: {str(e)}")
+    # Define a minimal function if import fails
+    def include_games_router(app):
+        logger.info("Using stub games router")
+        pass
 
 # Enum definitions for various parameter options
 class CognitiveMode(str, Enum):
@@ -300,29 +320,57 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS setup
+# Global exception handler middleware
+@app.middleware("http")
+async def catch_exceptions_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        logger.error(f"Unhandled exception: {str(e)}\n{traceback.format_exc()}")
+        
+        # Don't expose internal error details in production
+        if os.getenv("ENVIRONMENT", "development") == "production":
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal server error"}
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": f"Internal server error: {str(e)}",
+                    "traceback": traceback.format_exc()
+                }
+            )
+
+# CORS setup - more secure configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 
 # Include games endpoints
-include_games_router(app)
+try:
+    include_games_router(app)
+    logger.info("Games router included successfully")
+except Exception as e:
+    logger.error(f"Failed to include games router: {str(e)}")
 
 # Initialize Sully instance
 try:
     sully = Sully()
-    print("Sully system initialized successfully")
+    logger.info("Sully system initialized successfully")
 except Exception as e:
-    print(f"Warning: Core Sully system initialization failed: {str(e)}")
-    print("Starting with limited functionality")
+    logger.error(f"Core Sully system initialization failed: {str(e)}")
+    logger.info("Starting with limited functionality")
     try:
         # Try with minimal Sully instance if regular initialization fails
         sully = Sully()
-    except:
+    except Exception as e:
+        logger.error(f"Minimal Sully initialization also failed: {str(e)}")
         sully = None
 
 # Initialize separate modules if not available in main Sully instance
@@ -333,40 +381,46 @@ try:
         memory_system=sully.memory if sully else None,
         codex=sully.codex if sully else None
     )
+    logger.info("Conversation engine initialized successfully")
 except Exception as e:
-    print(f"Warning: Conversation engine initialization failed: {str(e)}")
+    logger.error(f"Conversation engine initialization failed: {str(e)}")
     conversation_engine = None
 
 try:
     from sully_engine.kernel_modules.persona import Persona
     persona_engine = Persona()
+    logger.info("Persona engine initialized successfully")
 except Exception as e:
-    print(f"Warning: Persona engine initialization failed: {str(e)}")
+    logger.error(f"Persona engine initialization failed: {str(e)}")
     persona_engine = None
 
 try:
     from sully_engine.kernel_modules.virtue import VirtueEngine
     virtue_engine = VirtueEngine()
+    logger.info("Virtue engine initialized successfully")
 except Exception as e:
-    print(f"Warning: Virtue engine initialization failed: {str(e)}")
+    logger.error(f"Virtue engine initialization failed: {str(e)}")
     virtue_engine = None
 
 try:
     from sully_engine.kernel_modules.intuition import Intuition
     intuition_engine = Intuition()
+    logger.info("Intuition engine initialized successfully")
 except Exception as e:
-    print(f"Warning: Intuition engine initialization failed: {str(e)}")
+    logger.error(f"Intuition engine initialization failed: {str(e)}")
     intuition_engine = None
 
 # Helper function to check if Sully is initialized
 def check_sully():
     if not sully:
+        logger.error("Sully system not properly initialized")
         raise HTTPException(status_code=500, detail="Sully system not properly initialized")
     return sully  # Return the sully instance
 
 # Helper function to check if the conversation engine is initialized
 def check_conversation():
     if not conversation_engine:
+        logger.error("Conversation engine not properly initialized")
         raise HTTPException(status_code=500, detail="Conversation engine not properly initialized")
     return conversation_engine
 
@@ -374,6 +428,7 @@ def check_conversation():
 def get_sully_module(module_name):
     s = check_sully()
     if not hasattr(s, module_name):
+        logger.error(f"Module '{module_name}' not available")
         raise HTTPException(status_code=501, detail=f"Module '{module_name}' not available")
     return getattr(s, module_name)
 
@@ -397,6 +452,40 @@ async def root():
         ]
     }
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring."""
+    try:
+        system_status = "healthy"
+        if sully:
+            # Try a basic operation to verify system functionality
+            try:
+                if hasattr(sully, "reason"):
+                    sully.reason("test", "analytical")
+                    sully_status = "operational"
+                else:
+                    sully_status = "initialized_with_limited_capabilities"
+            except Exception as e:
+                logger.warning(f"Health check sully operation failed: {str(e)}")
+                sully_status = "initialized_with_errors"
+        else:
+            sully_status = "not_initialized"
+            
+        return {
+            "status": system_status,
+            "sully_status": sully_status,
+            "timestamp": datetime.now().isoformat(),
+            "version": "1.0.0"
+        }
+    except Exception as e:
+        logger.error(f"Health check error: {str(e)}")
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat(),
+            "version": "1.0.0"
+        }
+
 @app.get("/system_status")
 async def system_status():
     """Get comprehensive system status."""
@@ -418,7 +507,8 @@ async def system_status():
     if hasattr(sully, "get_memory_status"):
         try:
             memory_status = sully.get_memory_status()
-        except:
+        except Exception as e:
+            logger.error(f"Failed to get memory status: {str(e)}")
             memory_status = {"status": "error", "message": "Unable to get memory status"}
     
     # Get kernel integration status if available
@@ -429,7 +519,8 @@ async def system_status():
                 kernel_status = sully.kernel_integration.get_stats()
             else:
                 kernel_status = {"status": "active", "details": "Statistics not available"}
-        except:
+        except Exception as e:
+            logger.error(f"Failed to get kernel integration status: {str(e)}")
             kernel_status = {"status": "error", "message": "Unable to get kernel integration status"}
     
     return {
@@ -453,14 +544,21 @@ async def chat(request: MessageRequest):
         )
         
         # Extract current topics for response
-        topics = ce.current_topics.copy() if ce.current_topics else []
+        topics = ce.current_topics.copy() if hasattr(ce, "current_topics") and ce.current_topics else []
         
         return MessageResponse(
             response=response,
             tone=request.tone,
             topics=topics
         )
+    except AttributeError as e:
+        logger.error(f"Chat processing method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Chat processing functionality not available: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Invalid input for chat: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
+        logger.error(f"Error processing chat message: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
 
 @app.post("/chat_plus")
@@ -482,7 +580,8 @@ async def chat_plus(request: MessageRequestPlus):
                 persona_engine.mode = request.persona
                 response = persona_engine.transform(response)
             except Exception as e:
-                print(f"Persona transformation error: {str(e)}")
+                logger.error(f"Persona transformation error: {str(e)}")
+                logger.info("Continuing with untransformed response")
 
         # Step 3: Optional virtue scoring
         virtue_result = None
@@ -492,7 +591,7 @@ async def chat_plus(request: MessageRequestPlus):
                 top = virtue_result[0][0] if virtue_result else "N/A"
                 response += f"\n\n🧭 Dominant Virtue: **{top.title()}**"
             except Exception as e:
-                print(f"Virtue evaluation error: {str(e)}")
+                logger.error(f"Virtue evaluation error: {str(e)}")
 
         # Step 4: Optional intuition leap
         if request.use_intuition and intuition_engine:
@@ -500,17 +599,24 @@ async def chat_plus(request: MessageRequestPlus):
                 leap = intuition_engine.leap(request.message)
                 response += f"\n\n🔮 Intuition: {leap}"
             except Exception as e:
-                print(f"Intuition error: {str(e)}")
+                logger.error(f"Intuition error: {str(e)}")
 
         return {
             "response": response,
             "tone": request.tone,
             "persona": request.persona,
             "virtue_scores": virtue_result or [],
-            "topics": ce.current_topics
+            "topics": ce.current_topics if hasattr(ce, "current_topics") else []
         }
 
+    except AttributeError as e:
+        logger.error(f"Enhanced chat processing method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Enhanced chat functionality not available: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Invalid input for enhanced chat: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
+        logger.error(f"Enhanced chat error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Enhanced chat error: {str(e)}")
 
 @app.post("/reason")
@@ -521,7 +627,14 @@ async def reason(message: str = Body(...), tone: CognitiveMode = Body(CognitiveM
     try:
         response = s.reason(message, tone)
         return {"response": response, "tone": tone}
+    except AttributeError as e:
+        logger.error(f"Reasoning method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Reasoning functionality not available: {str(e)}")
+    except ValueError as e:
+        logger.error(f"Invalid input for reasoning: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
     except Exception as e:
+        logger.error(f"Reasoning error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Reasoning error: {str(e)}")
 
 @app.post("/reason/with_memory")
@@ -529,16 +642,24 @@ async def reason_with_memory(message: str = Body(...), tone: CognitiveMode = Bod
     """Process input through Sully's reasoning system with memory integration."""
     s = check_sully()
     
-    if not hasattr(s.reasoning_node, 'reason_with_memory'):
+    if not hasattr(s, "reasoning_node") or not hasattr(s.reasoning_node, 'reason_with_memory'):
+        logger.warning("Falling back to standard reasoning as memory-enhanced reasoning not available")
         return await reason(message, tone)
     
     try:
         response = s.reasoning_node.reason_with_memory(message, tone)
         return {"response": response, "tone": tone, "memory_enhanced": True}
     except Exception as e:
+        logger.error(f"Memory-enhanced reasoning error: {str(e)}\n{traceback.format_exc()}")
+        logger.info("Falling back to standard reasoning")
+        
         # Fall back to standard reasoning
-        response = s.reason(message, tone)
-        return {"response": response, "tone": tone, "memory_enhanced": False, "fallback_reason": str(e)}
+        try:
+            response = s.reason(message, tone)
+            return {"response": response, "tone": tone, "memory_enhanced": False, "fallback_reason": str(e)}
+        except Exception as e2:
+            logger.error(f"Standard reasoning fallback also failed: {str(e2)}")
+            raise HTTPException(status_code=500, detail=f"Reasoning error: {str(e)} (fallback also failed: {str(e2)})")
 
 @app.post("/ingest_document", response_model=DocumentResponse)
 async def ingest_document(request: DocumentRequest):
@@ -548,7 +669,14 @@ async def ingest_document(request: DocumentRequest):
     try:
         result = s.ingest_document(request.file_path)
         return DocumentResponse(result=result)
+    except FileNotFoundError as e:
+        logger.error(f"Document not found: {request.file_path}")
+        raise HTTPException(status_code=404, detail=f"Document not found: {request.file_path}")
+    except AttributeError as e:
+        logger.error(f"Document ingestion method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Document ingestion functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Document ingestion error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Document ingestion error: {str(e)}")
 
 @app.post("/ingest_folder")
@@ -557,9 +685,17 @@ async def ingest_folder(folder_path: str = Body(..., embed=True)):
     s = check_sully()
     
     try:
+        if not os.path.isdir(folder_path):
+            logger.error(f"Folder not found: {folder_path}")
+            raise HTTPException(status_code=404, detail=f"Folder not found: {folder_path}")
+            
         results = s.load_documents_from_folder(folder_path)
         return {"results": results}
+    except AttributeError as e:
+        logger.error(f"Folder ingestion method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Folder ingestion functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Folder ingestion error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Folder ingestion error: {str(e)}")
 
 # --- Creative Functions Routes ---
@@ -577,7 +713,11 @@ async def dream(request: DreamRequest):
             depth=request.depth,
             style=request.style
         )
+    except AttributeError as e:
+        logger.error(f"Dream generation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Dream generation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Dream generation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Dream generation error: {str(e)}")
 
 @app.post("/dream/advanced")
@@ -591,9 +731,15 @@ async def dream_advanced(
 ):
     """Generate a dream with advanced control options."""
     s = check_sully()
-    dream_module = get_sully_module("dream")
     
     try:
+        # First check if dream module exists
+        if not hasattr(s, "dream"):
+            logger.error("Dream functionality not available")
+            raise HTTPException(status_code=501, detail="Dream functionality not available")
+            
+        dream_module = get_sully_module("dream")
+        
         # First generate base dream
         dream_result = s.dream(seed, depth, style)
         
@@ -634,6 +780,7 @@ async def dream_advanced(
             }
         }
     except Exception as e:
+        logger.error(f"Advanced dream generation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Advanced dream generation error: {str(e)}")
 
 @app.post("/fuse", response_model=FuseResponse)
@@ -648,7 +795,11 @@ async def fuse(request: FuseRequest):
             concepts=request.concepts,
             style=request.style
         )
+    except AttributeError as e:
+        logger.error(f"Fusion method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Fusion functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Fusion error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Fusion error: {str(e)}")
 
 @app.post("/fuse/advanced")
@@ -661,9 +812,15 @@ async def fuse_advanced(
 ):
     """Advanced concept fusion with style and cognitive mode options."""
     s = check_sully()
-    fusion_module = get_sully_module("fusion")
     
     try:
+        # First check if fusion module exists
+        if not hasattr(s, "fuse"):
+            logger.error("Fusion functionality not available")
+            raise HTTPException(status_code=501, detail="Fusion functionality not available")
+            
+        fusion_module = get_sully_module("fusion")
+        
         # If fusion module has advanced methods, use them
         if hasattr(fusion_module, "fuse_with_weights") and weighting:
             result = fusion_module.fuse_with_weights(concepts, weighting)
@@ -687,6 +844,7 @@ async def fuse_advanced(
             "output_format": output_format
         }
     except Exception as e:
+        logger.error(f"Advanced fusion error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Advanced fusion error: {str(e)}")
 
 # --- Analytical Functions Routes ---
@@ -699,14 +857,17 @@ async def evaluate_claim(request: ClaimEvaluationRequest):
     try:
         result = s.evaluate_claim(request.text, request.framework, request.detailed_output)
         return result
+    except AttributeError as e:
+        logger.error(f"Claim evaluation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Claim evaluation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Evaluation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Evaluation error: {str(e)}")
 
 @app.post("/evaluate/multi")
 async def evaluate_multi_framework(request: MultiFrameworkEvaluationRequest):
     """Analyze a claim through multiple evaluation frameworks simultaneously."""
     s = check_sully()
-    judgment = get_sully_module("judgment")
     
     results = {}
     try:
@@ -729,7 +890,11 @@ async def evaluate_multi_framework(request: MultiFrameworkEvaluationRequest):
             "framework_evaluations": results,
             "synthesis": synthesis
         }
+    except AttributeError as e:
+        logger.error(f"Multi-framework evaluation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Multi-framework evaluation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Multi-framework evaluation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Multi-framework evaluation error: {str(e)}")
 
 @app.post("/translate/math")
@@ -745,7 +910,11 @@ async def translate_math(request: MathTranslationRequest):
             "style": request.style,
             "domain": request.domain
         }
+    except AttributeError as e:
+        logger.error(f"Math translation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Math translation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Math translation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Math translation error: {str(e)}")
 
 @app.post("/paradox")
@@ -776,7 +945,11 @@ async def paradox(request: ParadoxRequest):
             "topic": request.topic,
             "paradox": result
         }
+    except AttributeError as e:
+        logger.error(f"Paradox exploration method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Paradox exploration functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Paradox exploration error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Paradox exploration error: {str(e)}")
 
 # --- Logical Reasoning Routes ---
@@ -789,7 +962,11 @@ async def logic_assert(request: LogicalStatementRequest):
     try:
         result = s.logical_integration(request.statement, request.truth_value)
         return result
+    except AttributeError as e:
+        logger.error(f"Logical assertion method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Logical assertion functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Logical assertion error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical assertion error: {str(e)}")
 
 @app.post("/logic/rule")
@@ -809,7 +986,11 @@ async def logic_rule(request: LogicalRuleRequest):
         }
         
         return result
+    except AttributeError as e:
+        logger.error(f"Logical rule definition method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Logical rule definition functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Logical rule definition error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical rule definition error: {str(e)}")
 
 @app.post("/logic/infer")
@@ -820,7 +1001,11 @@ async def logic_infer(request: LogicalQueryRequest):
     try:
         result = s.logical_reasoning(request.query, request.framework)
         return result
+    except AttributeError as e:
+        logger.error(f"Logical inference method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Logical inference functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Logical inference error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical inference error: {str(e)}")
 
 @app.post("/logic/proof")
@@ -847,6 +1032,7 @@ async def logic_proof(query: str = Body(...), framework: LogicalFramework = Body
             "note": "Generated through reasoning, not formal logic kernel"
         }
     except Exception as e:
+        logger.error(f"Logical proof generation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical proof generation error: {str(e)}")
 
 @app.post("/logic/equivalence")
@@ -873,6 +1059,7 @@ async def logic_equivalence(statement1: str = Body(...), statement2: str = Body(
             "note": "Generated through reasoning, not formal logic kernel"
         }
     except Exception as e:
+        logger.error(f"Logical equivalence error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical equivalence error: {str(e)}")
 
 @app.post("/logic/query")
@@ -898,6 +1085,7 @@ async def logic_db_query(request: LogicalQueryRequest):
             "note": "Generated through reasoning, not formal logic kernel"
         }
     except Exception as e:
+        logger.error(f"Logical query error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical query error: {str(e)}")
 
 @app.get("/logic/paradoxes")
@@ -908,7 +1096,11 @@ async def logic_paradoxes():
     try:
         result = s.detect_logical_inconsistencies()
         return result
+    except AttributeError as e:
+        logger.error(f"Logical paradox detection method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Logical paradox detection functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Logical paradox detection error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical paradox detection error: {str(e)}")
 
 @app.post("/logic/undecidable")
@@ -934,6 +1126,7 @@ async def logic_undecidable(statement: str = Body(...)):
             "note": "Generated through reasoning, not formal logic kernel"
         }
     except Exception as e:
+        logger.error(f"Undecidability analysis error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Undecidability analysis error: {str(e)}")
 
 @app.post("/logic/argument")
@@ -944,7 +1137,11 @@ async def logic_argument(premises: List[str] = Body(...), conclusion: str = Body
     try:
         result = s.validate_argument(premises, conclusion)
         return result
+    except AttributeError as e:
+        logger.error(f"Argument validation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Argument validation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Argument validation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Argument validation error: {str(e)}")
 
 @app.get("/logic/consistency")
@@ -955,7 +1152,11 @@ async def logic_consistency():
     try:
         result = s.detect_logical_inconsistencies()
         return result
+    except AttributeError as e:
+        logger.error(f"Logical consistency check method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Logical consistency check functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Logical consistency check error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logical consistency check error: {str(e)}")
 
 @app.post("/logic/revise")
@@ -966,7 +1167,11 @@ async def logic_revise(statement: str = Body(...), truth_value: bool = Body(True
     try:
         result = s.logical_integration(statement, truth_value)
         return result
+    except AttributeError as e:
+        logger.error(f"Belief revision method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Belief revision functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Belief revision error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Belief revision error: {str(e)}")
 
 @app.post("/logic/retract")
@@ -987,6 +1192,7 @@ async def logic_retract(statement: str = Body(...)):
             "message": "Belief retraction not available in current logic kernel"
         }
     except Exception as e:
+        logger.error(f"Belief retraction error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Belief retraction error: {str(e)}")
 
 @app.get("/logic/stats")
@@ -1009,6 +1215,7 @@ async def logic_stats():
             "consistency": "Unknown"
         }
     except Exception as e:
+        logger.error(f"Logic statistics error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Logic statistics error: {str(e)}")
 
 # --- Kernel Integration Routes ---
@@ -1021,7 +1228,11 @@ async def kernel_integration_narrative(request: NarrativeRequest):
     try:
         result = s.integrated_explore(request.concept, request.include_kernels)
         return result
+    except AttributeError as e:
+        logger.error(f"Cross-kernel narrative method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Cross-kernel narrative functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Cross-kernel narrative error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Cross-kernel narrative error: {str(e)}")
 
 @app.post("/kernel_integration/concept_network")
@@ -1032,7 +1243,11 @@ async def kernel_integration_concept_network(request: ConceptNetworkRequest):
     try:
         result = s.concept_network(request.concept, request.depth)
         return result
+    except AttributeError as e:
+        logger.error(f"Concept network method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Concept network functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Concept network error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Concept network error: {str(e)}")
 
 @app.post("/kernel_integration/deep_exploration")
@@ -1043,7 +1258,11 @@ async def kernel_integration_deep_exploration(request: DeepExplorationRequest):
     try:
         result = s.deep_concept_exploration(request.concept, request.depth, request.breadth)
         return result
+    except AttributeError as e:
+        logger.error(f"Deep exploration method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Deep exploration functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Deep exploration error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Deep exploration error: {str(e)}")
 
 @app.post("/kernel_integration/cross_kernel")
@@ -1054,7 +1273,11 @@ async def kernel_integration_cross_kernel(request: CrossKernelRequest):
     try:
         result = s.cross_kernel_operation(request.source_kernel, request.target_kernel, request.input_data)
         return result
+    except AttributeError as e:
+        logger.error(f"Cross-kernel operation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Cross-kernel operation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Cross-kernel operation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Cross-kernel operation error: {str(e)}")
 
 @app.post("/kernel_integration/process_pdf")
@@ -1065,7 +1288,14 @@ async def kernel_integration_process_pdf(request: PDFProcessRequest):
     try:
         result = s.process_pdf_with_kernels(request.pdf_path, request.extract_structure)
         return result
+    except FileNotFoundError:
+        logger.error(f"PDF file not found: {request.pdf_path}")
+        raise HTTPException(status_code=404, detail=f"PDF file not found: {request.pdf_path}")
+    except AttributeError as e:
+        logger.error(f"PDF processing method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"PDF processing functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"PDF processing error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
 
 @app.post("/kernel_integration/extract_document_kernel")
@@ -1076,7 +1306,14 @@ async def kernel_integration_extract_document_kernel(request: DocumentKernelRequ
     try:
         result = s.extract_document_kernel(request.pdf_path, request.domain)
         return result
+    except FileNotFoundError:
+        logger.error(f"PDF file not found: {request.pdf_path}")
+        raise HTTPException(status_code=404, detail=f"PDF file not found: {request.pdf_path}")
+    except AttributeError as e:
+        logger.error(f"Document kernel extraction method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Document kernel extraction functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Document kernel extraction error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Document kernel extraction error: {str(e)}")
 
 @app.post("/kernel_integration/generate_pdf_narrative")
@@ -1087,7 +1324,14 @@ async def kernel_integration_generate_pdf_narrative(request: PDFNarrativeRequest
     try:
         result = s.generate_pdf_narrative(request.pdf_path, request.focus_concept)
         return result
+    except FileNotFoundError:
+        logger.error(f"PDF file not found: {request.pdf_path}")
+        raise HTTPException(status_code=404, detail=f"PDF file not found: {request.pdf_path}")
+    except AttributeError as e:
+        logger.error(f"PDF narrative generation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"PDF narrative generation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"PDF narrative generation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"PDF narrative generation error: {str(e)}")
 
 @app.post("/kernel_integration/explore_pdf_concepts")
@@ -1098,7 +1342,14 @@ async def kernel_integration_explore_pdf_concepts(request: PDFConceptsRequest):
     try:
         result = s.explore_pdf_concepts(request.pdf_path, request.max_depth, request.exploration_breadth)
         return result
+    except FileNotFoundError:
+        logger.error(f"PDF file not found: {request.pdf_path}")
+        raise HTTPException(status_code=404, detail=f"PDF file not found: {request.pdf_path}")
+    except AttributeError as e:
+        logger.error(f"PDF concept exploration method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"PDF concept exploration functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"PDF concept exploration error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"PDF concept exploration error: {str(e)}")
 
 @app.get("/kernel_integration/status")
@@ -1107,7 +1358,7 @@ async def kernel_integration_status():
     s = check_sully()
     
     try:
-        if not s.kernel_integration:
+        if not hasattr(s, "kernel_integration") or not s.kernel_integration:
             return {"status": "not_available", "message": "Kernel integration system not initialized"}
         
         if hasattr(s.kernel_integration, "get_stats"):
@@ -1119,6 +1370,7 @@ async def kernel_integration_status():
             "message": "Kernel integration system is active"
         }
     except Exception as e:
+        logger.error(f"Kernel status error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Kernel status error: {str(e)}")
 
 @app.get("/kernel_integration/available_kernels")
@@ -1127,7 +1379,7 @@ async def kernel_integration_available_kernels():
     s = check_sully()
     
     try:
-        if not s.kernel_integration:
+        if not hasattr(s, "kernel_integration") or not s.kernel_integration:
             return {"kernels": [], "message": "Kernel integration system not initialized"}
         
         # Get available kernels
@@ -1154,6 +1406,7 @@ async def kernel_integration_available_kernels():
         
         return {"kernels": available_kernels}
     except Exception as e:
+        logger.error(f"Available kernels error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Available kernels error: {str(e)}")
 
 # --- Memory Integration Routes ---
@@ -1166,7 +1419,11 @@ async def memory_search(request: MemorySearchRequest):
     try:
         results = s.search_memory(request.query, request.limit)
         return {"query": request.query, "results": results}
+    except AttributeError as e:
+        logger.error(f"Memory search method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Memory search functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Memory search error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Memory search error: {str(e)}")
 
 @app.get("/memory/status")
@@ -1177,7 +1434,11 @@ async def memory_status():
     try:
         result = s.get_memory_status()
         return result
+    except AttributeError as e:
+        logger.error(f"Memory status method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Memory status functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Memory status error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Memory status error: {str(e)}")
 
 @app.get("/memory/emotional")
@@ -1188,7 +1449,11 @@ async def memory_emotional():
     try:
         result = s.analyze_emotional_context()
         return result
+    except AttributeError as e:
+        logger.error(f"Emotional context analysis method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Emotional context analysis functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Emotional context analysis error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Emotional context analysis error: {str(e)}")
 
 @app.post("/memory/begin_episode")
@@ -1207,6 +1472,7 @@ async def memory_begin_episode(request: BeginEpisodeRequest):
         
         return {"status": "success", "episode_id": episode_id}
     except Exception as e:
+        logger.error(f"Begin episode error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Begin episode error: {str(e)}")
 
 @app.post("/memory/end_episode")
@@ -1221,6 +1487,7 @@ async def memory_end_episode(summary: str = Body(...)):
         s.memory_integration.end_episode(summary)
         return {"status": "success", "summary": summary}
     except Exception as e:
+        logger.error(f"End episode error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"End episode error: {str(e)}")
 
 @app.post("/memory/store")
@@ -1241,6 +1508,7 @@ async def memory_store_interaction(request: StoreInteractionRequest):
         
         return {"status": "success"}
     except Exception as e:
+        logger.error(f"Store interaction error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Store interaction error: {str(e)}")
 
 @app.post("/memory/recall")
@@ -1270,6 +1538,7 @@ async def memory_recall(
         memories = s.memory_integration.recall(**kwargs)
         return {"memories": memories}
     except Exception as e:
+        logger.error(f"Memory recall error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Memory recall error: {str(e)}")
 
 @app.post("/memory/store_experience")
@@ -1293,6 +1562,7 @@ async def memory_store_experience(request: StoreExperienceRequest):
         
         return {"status": "success"}
     except Exception as e:
+        logger.error(f"Store experience error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Store experience error: {str(e)}")
 
 @app.post("/chat/with_memory")
@@ -1309,6 +1579,7 @@ async def chat_with_memory(message: str = Body(...), tone: CognitiveMode = Body(
         response = s.process(message)
         return {"response": response, "memory_enhanced": False}
     except Exception as e:
+        logger.error(f"Memory-enhanced chat error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Memory-enhanced chat error: {str(e)}")
 
 @app.post("/process/integrated")
@@ -1349,630 +1620,6 @@ async def process_integrated(
             if hasattr(s, "dream"):
                 dream_sequence = s.dream(message, "shallow", "symbolic")
                 response_parts["dream_perspective"] = dream_sequence
-        
-        return response_parts
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Integrated processing error: {str(e)}")
-
-# --- Identity & Personality Routes ---
-
-@app.get("/speak_identity")
-async def speak_identity():
-    """Express Sully's sense of self."""
-    s = check_sully()
-    
-    try:
-        result = s.speak_identity()
-        return {"identity_expression": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Identity expression error: {str(e)}")
-
-@app.post("/personas/custom")
-async def personas_custom(request: PersonaRequest):
-    """Create custom persona."""
-    s = check_sully()
-    
-    try:
-        # Check if identity module has the create_persona method
-        if hasattr(s, "identity") and hasattr(s.identity, "create_persona"):
-            result = s.identity.create_persona(
-                request.name,
-                request.traits,
-                request.description
-            )
-            return result
-        
-        # Fallback response if method not available
-        return {
-            "status": "error",
-            "message": "Custom persona creation not available in current identity system"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Custom persona creation error: {str(e)}")
-
-@app.post("/personas/composite")
-async def personas_composite(request: BlendedPersonaRequest):
-    """Create blended persona."""
-    s = check_sully()
-    
-    try:
-        # Check if identity module has the blend_personas method
-        if hasattr(s, "identity") and hasattr(s.identity, "blend_personas"):
-            result = s.identity.blend_personas(
-                request.name,
-                request.personas,
-                request.weights,
-                request.description
-            )
-            return result
-        
-        # Fallback response if method not available
-        return {
-            "status": "error",
-            "message": "Persona blending not available in current identity system"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Blended persona creation error: {str(e)}")
-
-@app.get("/personas")
-async def personas_list():
-    """List available personas."""
-    s = check_sully()
-    
-    try:
-        # Check if identity module has the get_personas method
-        if hasattr(s, "identity") and hasattr(s.identity, "get_personas"):
-            result = s.identity.get_personas()
-            return {"personas": result}
-        
-        # Fallback response if method not available
-        return {
-            "personas": ["default"],
-            "message": "Extended persona system not available"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Persona listing error: {str(e)}")
-
-@app.post("/identity/evolve")
-async def identity_evolve(request: EvolveIdentityRequest):
-    """Evolve personality traits based on interactions."""
-    s = check_sully()
-    
-    try:
-        result = s.evolve_identity(request.interactions, request.learning_rate)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Identity evolution error: {str(e)}")
-
-@app.post("/identity/adapt")
-async def identity_adapt(request: AdaptIdentityRequest):
-    """Adapt identity to specific context."""
-    s = check_sully()
-    
-    try:
-        result = s.adapt_identity_to_context(request.context, request.context_data)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Identity adaptation error: {str(e)}")
-
-@app.get("/identity/profile")
-async def identity_profile(detailed: bool = Query(False)):
-    """Get comprehensive personality profile."""
-    s = check_sully()
-    
-    try:
-        result = s.get_identity_profile(detailed)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Identity profile error: {str(e)}")
-
-@app.post("/identity/generate_persona")
-async def identity_generate_persona(request: DynamicPersonaRequest):
-    """Dynamically generate a context-specific persona."""
-    s = check_sully()
-    
-    try:
-        persona_id, description = s.generate_dynamic_persona(
-            request.context_query,
-            request.principles,
-            request.traits
-        )
-        
-        return {
-            "persona_id": persona_id,
-            "description": description
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Persona generation error: {str(e)}")
-
-@app.get("/identity/map")
-async def identity_map():
-    """Get a comprehensive multi-level map of Sully's identity."""
-    s = check_sully()
-    
-    try:
-        result = s.create_identity_map()
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Identity mapping error: {str(e)}")
-
-@app.post("/transform")
-async def transform(request: TransformRequest):
-    """Transform a response according to a specific cognitive mode or persona."""
-    s = check_sully()
-    
-    try:
-        result = s.transform_response(
-            request.content,
-            request.mode,
-            request.context_data
-        )
-        
-        return {
-            "original": request.content,
-            "transformed": result,
-            "mode": request.mode
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transformation error: {str(e)}")
-
-# --- Emergent Systems Routes ---
-
-@app.post("/emergence/detect")
-async def emergence_detect(request: EmergenceDetectionRequest):
-    """Detect emergent patterns in cognitive system."""
-    s = check_sully()
-    
-    try:
-        # Check if emergence framework has the detect_emergence method
-        if hasattr(s, "emergence") and hasattr(s.emergence, "detect_emergence"):
-            result = s.emergence.detect_emergence(
-                request.module_interactions,
-                request.threshold
-            )
-            return result
-        
-        # Fallback using reasoning
-        insight = s.reason(
-            "Analyze the current system state for emergent cognitive patterns",
-            "analytical"
-        )
-        
-        return {
-            "emergent_patterns": [],
-            "analysis": insight,
-            "note": "Generated through reasoning, not formal emergence detection"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Emergence detection error: {str(e)}")
-
-@app.get("/emergence/properties")
-async def emergence_properties():
-    """View detected emergent properties."""
-    s = check_sully()
-    
-    try:
-        # Check if emergence framework has the get_properties method
-        if hasattr(s, "emergence") and hasattr(s.emergence, "get_properties"):
-            result = s.emergence.get_properties()
-            return result
-        
-        # Fallback response if method not available
-        return {
-            "properties": [],
-            "message": "Formal emergence property detection not available"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Emergence properties error: {str(e)}")
-
-# --- Learning & Knowledge Routes ---
-
-@app.post("/learning/process")
-async def learning_process(interaction: Dict[str, Any] = Body(...)):
-    """Process interaction for learning."""
-    s = check_sully()
-    
-    try:
-        # Check if learning system has process_interaction method
-        if hasattr(s, "continuous_learning") and hasattr(s.continuous_learning, "process_interaction"):
-            s.continuous_learning.process_interaction(interaction)
-            return {"status": "success"}
-        
-        # Fallback to basic memory
-        s.remember(str(interaction))
-        return {"status": "basic_storage", "message": "Stored in basic memory system"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Learning process error: {str(e)}")
-
-@app.post("/learning/consolidate")
-async def learning_consolidate():
-    """Consolidate experience into knowledge."""
-    s = check_sully()
-    
-    try:
-        # Check if learning system has consolidate_knowledge method
-        if hasattr(s, "continuous_learning") and hasattr(s.continuous_learning, "consolidate_knowledge"):
-            result = s.continuous_learning.consolidate_knowledge()
-            return result
-        
-        # Fallback using reasoning
-        insight = s.reason(
-            "Synthesize and consolidate recent experiences into deeper understanding",
-            "analytical"
-        )
-        
-        return {
-            "consolidated_insights": insight,
-            "note": "Generated through reasoning, not formal knowledge consolidation"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Knowledge consolidation error: {str(e)}")
-
-@app.get("/learning/statistics")
-async def learning_statistics():
-    """Get learning statistics."""
-    s = check_sully()
-    
-    try:
-        # Check if learning system has get_statistics method
-        if hasattr(s, "continuous_learning") and hasattr(s.continuous_learning, "get_statistics"):
-            result = s.continuous_learning.get_statistics()
-            return result
-        
-        # Fallback basic stats
-        return {
-            "status": "limited",
-            "message": "Detailed learning statistics not available",
-            "knowledge_items": len(s.knowledge) if hasattr(s, "knowledge") else "unknown"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Learning statistics error: {str(e)}")
-
-@app.get("/codex/search")
-async def codex_search(term: str = Query(...), limit: int = Query(10)):
-    """Search knowledge codex."""
-    s = check_sully()
-    
-    try:
-        # Check if codex has search method
-        if hasattr(s, "codex") and hasattr(s.codex, "search"):
-            result = s.codex.search(term)
-            
-            # Limit results if needed
-            if isinstance(result, dict) and len(result) > limit:
-                result = dict(list(result.items())[:limit])
-                
-            return result
-        
-        # Fallback using reasoning
-        insight = s.reason(
-            f"Share knowledge about the concept: {term}",
-            "analytical"
-        )
-        
-        return {
-            term: {
-                "definition": insight,
-                "note": "Generated through reasoning, not from formal codex"
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Codex search error: {str(e)}")
-
-# --- Autonomous Goals Routes ---
-
-@app.post("/goals/establish")
-async def goals_establish(request: GoalRequest):
-    """Establish new autonomous goal."""
-    s = check_sully()
-    
-    try:
-        # Check if goals system has establish_goal method
-        if hasattr(s, "autonomous_goals") and hasattr(s.autonomous_goals, "establish_goal"):
-            result = s.autonomous_goals.establish_goal(
-                request.goal,
-                request.priority,
-                request.domain,
-                request.deadline
-            )
-            return result
-        
-        # Fallback response if method not available
-        return {
-            "status": "acknowledged",
-            "goal": request.goal,
-            "message": "Goal acknowledged but autonomous goals system not fully available"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Goal establishment error: {str(e)}")
-
-@app.get("/goals/active")
-async def goals_active():
-    """View active goals."""
-    s = check_sully()
-    
-    try:
-        # Check if goals system has get_active_goals method
-        if hasattr(s, "autonomous_goals") and hasattr(s.autonomous_goals, "get_active_goals"):
-            result = s.autonomous_goals.get_active_goals()
-            return {"goals": result}
-        
-        # Fallback response if method not available
-        return {
-            "goals": [],
-            "message": "Autonomous goals system not fully available"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Active goals error: {str(e)}")
-
-@app.post("/interests/register")
-async def interests_register(request: InterestRequest):
-    """Register topic engagement."""
-    s = check_sully()
-    
-    try:
-        # Check if goals system has register_interest method
-        if hasattr(s, "autonomous_goals") and hasattr(s.autonomous_goals, "register_interest"):
-            result = s.autonomous_goals.register_interest(
-                request.topic,
-                request.engagement_level,
-                request.context
-            )
-            return result
-        
-        # Fallback response if method not available
-        return {
-            "status": "acknowledged",
-            "topic": request.topic,
-            "message": "Interest acknowledged but autonomous goals system not fully available"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Interest registration error: {str(e)}")
-
-# --- Visual Cognition Routes ---
-
-@app.post("/visual/process")
-async def visual_process(request: VisualProcessRequest):
-    """Process and understand images."""
-    s = check_sully()
-    
-    try:
-        # Check if visual cognition system is available
-        if hasattr(s, "visual_cognition") and hasattr(s.visual_cognition, "process_image"):
-            result = s.visual_cognition.process_image(
-                request.image_path,
-                request.analysis_depth,
-                request.include_objects,
-                request.include_scene
-            )
-            return result
-        
-        # Fallback for simple image extraction from PDFs
-        if request.image_path.lower().endswith(".pdf") and hasattr(s, "extract_images_from_pdf"):
-            temp_dir = f"temp_img_{uuid.uuid4().hex[:8]}"
-            extraction_result = s.extract_images_from_pdf(request.image_path, temp_dir)
-            
-            return {
-                "status": "limited",
-                "message": "Full visual cognition not available, extracted images from PDF",
-                "extraction_result": extraction_result
-            }
-        
-        # Complete fallback if no visual processing available
-        return {
-            "status": "error",
-            "message": "Visual processing not available in current system configuration"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Visual processing error: {str(e)}")
-
-@app.post("/ethics/virtue_evaluate")
-async def ethics_virtue_evaluate(request: VirtueEvaluationRequest):
-    """Evaluate content using virtue ethics."""
-    s = check_sully()
-    
-    try:
-        result = s.evaluate_virtue(request.content, request.context, request.domain)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Virtue evaluation error: {str(e)}")
-
-# --- Ethics & Intuition Routes ---
-
-@app.post("/virtue/evaluate")
-async def virtue_evaluate(request: VirtueEvaluationRequest):
-    """Evaluate content using virtue ethics."""
-    s = check_sully()
-    
-    try:
-        result = s.evaluate_virtue(request.content, request.context, request.domain)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Virtue evaluation error: {str(e)}")
-
-@app.post("/virtue/evaluate_action")
-async def virtue_evaluate_action(request: ActionVirtueRequest):
-    """Evaluate an action through virtue ethics framework."""
-    s = check_sully()
-    
-    try:
-        result = s.evaluate_action_virtue(request.action, request.context, request.domain)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Action virtue evaluation error: {str(e)}")
-
-@app.post("/virtue/reflect")
-async def virtue_reflect(virtue: str = Body(...)):
-    """Generate meta-ethical reflection on a specific virtue."""
-    s = check_sully()
-    
-    try:
-        if hasattr(s, "reflect_on_virtue"):
-            result = s.reflect_on_virtue(virtue)
-            return result
-        
-        # Fallback using reasoning
-        reflection = s.reason(
-            f"Provide a deep philosophical reflection on the virtue of {virtue}",
-            "philosophical"
-        )
-        
-        return {
-            "virtue": virtue,
-            "reflection": reflection,
-            "note": "Generated through reasoning, not formal virtue engine"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Virtue reflection error: {str(e)}")
-
-@app.post("/intuition/leap")
-async def intuition_leap(request: IntuitionRequest):
-    """Generate intuitive leaps."""
-    s = check_sully()
-    
-    try:
-        result = s.generate_intuitive_leap(
-            request.context,
-            request.concepts,
-            request.depth,
-            request.domain
-        )
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Intuitive leap error: {str(e)}")
-
-@app.post("/course_of_thought")
-async def course_of_thought(request: MultiPerspectiveRequest):
-    """Generate multi-perspective thought."""
-    s = check_sully()
-    
-    try:
-        result = s.generate_multi_perspective(request.topic, request.perspectives)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Multi-perspective thought error: {str(e)}")
-
-@app.post("/neural/analyze")
-async def neural_analyze(module: str = Body(...)):
-    """Analyze module performance."""
-    s = check_sully()
-    
-    try:
-        if hasattr(s, "neural_modification") and hasattr(s.neural_modification, "analyze_module"):
-            result = s.neural_modification.analyze_module(module)
-            return result
-        
-        # Fallback response if method not available
-        return {
-            "module": module,
-            "message": "Neural analysis not available for this module",
-            "status": "limited"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Neural analysis error: {str(e)}")
-
-@app.post("/user/consent")
-async def set_user_consent(request: Request):
-    body = await request.json()
-    user_id = body.get("user_id")
-    consent = body.get("consent", False)
-    user_consents[user_id] = consent
-    return {"status": "ok", "user_id": user_id, "consent": consent}
-
-@app.get("/user/context/{user_id}")
-def get_user_context(user_id: str):
-    if user_consents.get(user_id):
-        return user_contexts.get(user_id, {})
-    return {"error": "Consent not granted"}
-
-@app.post("/user/context/{user_id}")
-async def save_user_context(user_id: str, context: dict):
-    if user_consents.get(user_id):
-        user_contexts[user_id] = context
-        return {"status": "saved", "user_id": user_id}
-    return {"error": "Consent not granted"}
-
-@app.post("/admin/upload")
-async def upload_file(file: UploadFile = File(...), token: str = Query(...)):
-    if token != "yoursecretadmin":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    os.makedirs("admin_uploads", exist_ok=True)
-    file_path = os.path.join("admin_uploads", file.filename)
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-    return {"status": "uploaded", "filename": file.filename}
-
-@app.post("/web-fuse")
-async def web_fuse(payload: dict = Body(...)):
-    url = payload.get("url")
-    query = payload.get("query", "")
-    try:
-        from sully_engine.web_tools.webreader import fetch_web_content
-        from sully_engine.kernel_modules.fusion import SymbolFusionEngine
-        from sully_engine.kernel_modules.judgment import JudgmentProtocol
-        
-        raw_text = fetch_web_content(url)
-    except Exception as e:
-        return {"error": str(e)}
-    
-    judgment = JudgmentProtocol()
-    fusion_engine = SymbolFusionEngine()
-
-    internal_knowledge = query or "Sully's prior concept on this topic"
-    opinion = judgment.compare_sources(internal_knowledge, raw_text)
-    fused_result = fusion_engine.fuse_concepts(internal_knowledge, raw_text)
-
-    return {
-        "url": url,
-        "fused_concept": fused_result,
-        "judgment": opinion.get("verdict", "neutral"),
-        "rationale": opinion.get("rationale", "N/A")
-    }
-
-@app.post("/code-build")
-async def code_build(payload: dict = Body(...)):
-    prompt = payload.get("prompt")
-    if not prompt:
-        return {"error": "Missing prompt"}
-    
-    try:
-        from sully_engine.code_tools.codebrain import CodeBrain
-        brain = CodeBrain()
-        design = brain.interpret_goal(prompt)
-        plan = brain.generate_code_plan(design)
-        code = brain.synthesize_code(plan)
-        explanation = brain.explain_choices(plan)
-        return {
-            "design": design,
-            "code": code,
-            "explanation": explanation
-        }
-    except Exception as e:
-        return {"error": f"Code generation error: {str(e)}"}# Step 1: Retrieve relevant memories
-        memories = []
-        if retrieve_memories and hasattr(s, "search_memory"):
-            memories = s.search_memory(message, limit=3)
-            response_parts["memories"] = memories
-        
-        # Step 2: Process the message
-        if hasattr(s, "process_with_memory") and retrieve_memories:
-            response = s.process_with_memory(message)
-        else:
-            response = s.process(message)
-        
-        response_parts["response"] = response
-        
-        # Step 3: Add cross-modal processing if requested
-        if cross_modal and hasattr(s, "kernel_integration") and s.kernel_integration:
-            # Try to get cross-kernel insights
-            if hasattr(s.kernel_integration, "dynamic_process"):
-                insight = s.kernel_integration.dynamic_process(message, "insight")
-                response_parts["cross_modal_insight"] = insight
-            
-            # Try to add dream perspective
-            if hasattr(s, "dream"):
-                dream_sequence = s.dream(message, "shallow", "symbolic")
-                response_parts["dream_perspective"] = dream_sequence
                 
             # Try to add linguistic analysis if available
             if hasattr(s, "language_processor"):
@@ -1985,6 +1632,7 @@ async def code_build(payload: dict = Body(...)):
         
         return response_parts
     except Exception as e:
+        logger.error(f"Integrated processing error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Integrated processing error: {str(e)}")
 
 # --- Identity & Personality Routes ---
@@ -1997,7 +1645,11 @@ async def speak_identity():
     try:
         result = s.speak_identity()
         return {"identity_expression": result}
+    except AttributeError as e:
+        logger.error(f"Identity expression method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Identity expression functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Identity expression error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Identity expression error: {str(e)}")
 
 @app.post("/personas/custom")
@@ -2021,6 +1673,7 @@ async def personas_custom(request: PersonaRequest):
             "message": "Custom persona creation not available in current identity system"
         }
     except Exception as e:
+        logger.error(f"Custom persona creation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Custom persona creation error: {str(e)}")
 
 @app.post("/personas/composite")
@@ -2045,6 +1698,7 @@ async def personas_composite(request: BlendedPersonaRequest):
             "message": "Persona blending not available in current identity system"
         }
     except Exception as e:
+        logger.error(f"Blended persona creation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Blended persona creation error: {str(e)}")
 
 @app.get("/personas")
@@ -2064,6 +1718,7 @@ async def personas_list():
             "message": "Extended persona system not available"
         }
     except Exception as e:
+        logger.error(f"Persona listing error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Persona listing error: {str(e)}")
 
 @app.post("/identity/evolve")
@@ -2074,7 +1729,11 @@ async def identity_evolve(request: EvolveIdentityRequest):
     try:
         result = s.evolve_identity(request.interactions, request.learning_rate)
         return result
+    except AttributeError as e:
+        logger.error(f"Identity evolution method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Identity evolution functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Identity evolution error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Identity evolution error: {str(e)}")
 
 @app.post("/identity/adapt")
@@ -2085,7 +1744,11 @@ async def identity_adapt(request: AdaptIdentityRequest):
     try:
         result = s.adapt_identity_to_context(request.context, request.context_data)
         return result
+    except AttributeError as e:
+        logger.error(f"Identity adaptation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Identity adaptation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Identity adaptation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Identity adaptation error: {str(e)}")
 
 @app.get("/identity/profile")
@@ -2096,7 +1759,11 @@ async def identity_profile(detailed: bool = Query(False)):
     try:
         result = s.get_identity_profile(detailed)
         return result
+    except AttributeError as e:
+        logger.error(f"Identity profile method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Identity profile functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Identity profile error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Identity profile error: {str(e)}")
 
 @app.post("/identity/generate_persona")
@@ -2115,7 +1782,11 @@ async def identity_generate_persona(request: DynamicPersonaRequest):
             "persona_id": persona_id,
             "description": description
         }
+    except AttributeError as e:
+        logger.error(f"Persona generation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Persona generation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Persona generation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Persona generation error: {str(e)}")
 
 @app.get("/identity/map")
@@ -2126,7 +1797,11 @@ async def identity_map():
     try:
         result = s.create_identity_map()
         return result
+    except AttributeError as e:
+        logger.error(f"Identity mapping method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Identity mapping functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Identity mapping error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Identity mapping error: {str(e)}")
 
 @app.post("/transform")
@@ -2146,7 +1821,11 @@ async def transform(request: TransformRequest):
             "transformed": result,
             "mode": request.mode
         }
+    except AttributeError as e:
+        logger.error(f"Transformation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Transformation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Transformation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Transformation error: {str(e)}")
 
 # --- Emergent Systems Routes ---
@@ -2177,6 +1856,7 @@ async def emergence_detect(request: EmergenceDetectionRequest):
             "note": "Generated through reasoning, not formal emergence detection"
         }
     except Exception as e:
+        logger.error(f"Emergence detection error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Emergence detection error: {str(e)}")
 
 @app.get("/emergence/properties")
@@ -2196,6 +1876,7 @@ async def emergence_properties():
             "message": "Formal emergence property detection not available"
         }
     except Exception as e:
+        logger.error(f"Emergence properties error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Emergence properties error: {str(e)}")
 
 # --- Learning & Knowledge Routes ---
@@ -2215,6 +1896,7 @@ async def learning_process(interaction: Dict[str, Any] = Body(...)):
         s.remember(str(interaction))
         return {"status": "basic_storage", "message": "Stored in basic memory system"}
     except Exception as e:
+        logger.error(f"Learning process error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Learning process error: {str(e)}")
 
 @app.post("/learning/consolidate")
@@ -2239,6 +1921,7 @@ async def learning_consolidate():
             "note": "Generated through reasoning, not formal knowledge consolidation"
         }
     except Exception as e:
+        logger.error(f"Knowledge consolidation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Knowledge consolidation error: {str(e)}")
 
 @app.get("/learning/statistics")
@@ -2259,6 +1942,7 @@ async def learning_statistics():
             "knowledge_items": len(s.knowledge) if hasattr(s, "knowledge") else "unknown"
         }
     except Exception as e:
+        logger.error(f"Learning statistics error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Learning statistics error: {str(e)}")
 
 @app.get("/codex/search")
@@ -2290,6 +1974,7 @@ async def codex_search(term: str = Query(...), limit: int = Query(10)):
             }
         }
     except Exception as e:
+        logger.error(f"Codex search error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Codex search error: {str(e)}")
 
 # --- Autonomous Goals Routes ---
@@ -2317,6 +2002,7 @@ async def goals_establish(request: GoalRequest):
             "message": "Goal acknowledged but autonomous goals system not fully available"
         }
     except Exception as e:
+        logger.error(f"Goal establishment error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Goal establishment error: {str(e)}")
 
 @app.get("/goals/active")
@@ -2336,6 +2022,7 @@ async def goals_active():
             "message": "Autonomous goals system not fully available"
         }
     except Exception as e:
+        logger.error(f"Active goals error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Active goals error: {str(e)}")
 
 @app.post("/interests/register")
@@ -2360,6 +2047,7 @@ async def interests_register(request: InterestRequest):
             "message": "Interest acknowledged but autonomous goals system not fully available"
         }
     except Exception as e:
+        logger.error(f"Interest registration error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Interest registration error: {str(e)}")
 
 # --- Visual Cognition Routes ---
@@ -2397,18 +2085,8 @@ async def visual_process(request: VisualProcessRequest):
             "message": "Visual processing not available in current system configuration"
         }
     except Exception as e:
+        logger.error(f"Visual processing error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Visual processing error: {str(e)}")
-
-@app.post("/ethics/virtue_evaluate")
-async def ethics_virtue_evaluate(request: VirtueEvaluationRequest):
-    """Evaluate content using virtue ethics."""
-    s = check_sully()
-    
-    try:
-        result = s.evaluate_virtue(request.content, request.context, request.domain)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Virtue evaluation error: {str(e)}")
 
 # --- Ethics & Intuition Routes ---
 
@@ -2420,7 +2098,11 @@ async def virtue_evaluate(request: VirtueEvaluationRequest):
     try:
         result = s.evaluate_virtue(request.content, request.context, request.domain)
         return result
+    except AttributeError as e:
+        logger.error(f"Virtue evaluation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Virtue evaluation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Virtue evaluation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Virtue evaluation error: {str(e)}")
 
 @app.post("/virtue/evaluate_action")
@@ -2431,7 +2113,11 @@ async def virtue_evaluate_action(request: ActionVirtueRequest):
     try:
         result = s.evaluate_action_virtue(request.action, request.context, request.domain)
         return result
+    except AttributeError as e:
+        logger.error(f"Action virtue evaluation method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Action virtue evaluation functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Action virtue evaluation error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Action virtue evaluation error: {str(e)}")
 
 @app.post("/virtue/reflect")
@@ -2456,6 +2142,7 @@ async def virtue_reflect(virtue: str = Body(...)):
             "note": "Generated through reasoning, not formal virtue engine"
         }
     except Exception as e:
+        logger.error(f"Virtue reflection error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Virtue reflection error: {str(e)}")
 
 @app.post("/intuition/leap")
@@ -2471,7 +2158,11 @@ async def intuition_leap(request: IntuitionRequest):
             request.domain
         )
         return result
+    except AttributeError as e:
+        logger.error(f"Intuitive leap method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Intuitive leap functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Intuitive leap error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Intuitive leap error: {str(e)}")
 
 @app.post("/course_of_thought")
@@ -2482,7 +2173,11 @@ async def course_of_thought(request: MultiPerspectiveRequest):
     try:
         result = s.generate_multi_perspective(request.topic, request.perspectives)
         return result
+    except AttributeError as e:
+        logger.error(f"Multi-perspective thought method not available: {str(e)}")
+        raise HTTPException(status_code=501, detail=f"Multi-perspective thought functionality not available: {str(e)}")
     except Exception as e:
+        logger.error(f"Multi-perspective thought error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Multi-perspective thought error: {str(e)}")
 
 @app.post("/neural/analyze")
@@ -2502,83 +2197,139 @@ async def neural_analyze(module: str = Body(...)):
             "status": "limited"
         }
     except Exception as e:
+        logger.error(f"Neural analysis error: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Neural analysis error: {str(e)}")
+
+# --- User Context & Administration Routes ---
 
 @app.post("/user/consent")
 async def set_user_consent(request: Request):
-    body = await request.json()
-    user_id = body.get("user_id")
-    consent = body.get("consent", False)
-    user_consents[user_id] = consent
-    return {"status": "ok", "user_id": user_id, "consent": consent}
+    try:
+        body = await request.json()
+        user_id = body.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Missing user_id")
+            
+        consent = body.get("consent", False)
+        user_consents[user_id] = consent
+        logger.info(f"User consent updated for user {user_id}: {consent}")
+        return {"status": "ok", "user_id": user_id, "consent": consent}
+    except Exception as e:
+        logger.error(f"User consent error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"User consent error: {str(e)}")
 
 @app.get("/user/context/{user_id}")
 def get_user_context(user_id: str):
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+        
     if user_consents.get(user_id):
         return user_contexts.get(user_id, {})
     return {"error": "Consent not granted"}
 
 @app.post("/user/context/{user_id}")
-async def save_user_context(user_id: str, context: dict):
+async def save_user_context(user_id: str, context: Dict[str, Any] = Body(...)):
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+        
     if user_consents.get(user_id):
         user_contexts[user_id] = context
+        logger.info(f"User context saved for user {user_id}")
         return {"status": "saved", "user_id": user_id}
     return {"error": "Consent not granted"}
 
 @app.post("/admin/upload")
-async def upload_file(file: UploadFile = File(...), token: str = Query(...)):
-    if token != "yoursecretadmin":
+async def upload_file(
+    file: UploadFile = File(...), 
+    token: str = Query(...)
+):
+    """Upload file to admin storage."""
+    # Get admin token from environment variable with fallback
+    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "yoursecretadmin")
+    
+    if token != ADMIN_TOKEN:
+        logger.warning(f"Unauthorized admin upload attempt with token: {token[:3]}...")
         raise HTTPException(status_code=401, detail="Unauthorized")
-    os.makedirs("admin_uploads", exist_ok=True)
-    file_path = os.path.join("admin_uploads", file.filename)
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-    return {"status": "uploaded", "filename": file.filename}
+    
+    try:
+        os.makedirs("admin_uploads", exist_ok=True)
+        file_path = os.path.join("admin_uploads", file.filename)
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+        logger.info(f"Successful file upload: {file.filename}")
+        return {"status": "uploaded", "filename": file.filename}
+    except Exception as e:
+        logger.error(f"File upload error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+# --- Web Integration Routes ---
 
 @app.post("/web-fuse")
-async def web_fuse(payload: dict = Body(...)):
+async def web_fuse(payload: Dict[str, Any] = Body(...)):
+    """Fuse web content with existing knowledge."""
     url = payload.get("url")
     query = payload.get("query", "")
+    
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url parameter")
+    
     try:
         from sully_engine.web_tools.webreader import fetch_web_content
         from sully_engine.kernel_modules.fusion import SymbolFusionEngine
         from sully_engine.kernel_modules.judgment import JudgmentProtocol
         
         raw_text = fetch_web_content(url)
+        logger.info(f"Successfully fetched content from: {url}")
+    except ImportError as e:
+        logger.error(f"Web tools import error: {str(e)}")
+        raise HTTPException(status_code=501, detail="Web fusion functionality not available")
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Web content fetch error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error fetching web content: {str(e)}")
     
-    judgment = JudgmentProtocol()
-    fusion_engine = SymbolFusionEngine()
+    try:
+        judgment = JudgmentProtocol()
+        fusion_engine = SymbolFusionEngine()
 
-    internal_knowledge = query or "Sully's prior concept on this topic"
-    opinion = judgment.compare_sources(internal_knowledge, raw_text)
-    fused_result = fusion_engine.fuse_concepts(internal_knowledge, raw_text)
+        internal_knowledge = query or "Sully's prior concept on this topic"
+        opinion = judgment.compare_sources(internal_knowledge, raw_text)
+        fused_result = fusion_engine.fuse_concepts(internal_knowledge, raw_text)
 
-    return {
-        "url": url,
-        "fused_concept": fused_result,
-        "judgment": opinion.get("verdict", "neutral"),
-        "rationale": opinion.get("rationale", "N/A")
-    }
+        return {
+            "url": url,
+            "fused_concept": fused_result,
+            "judgment": opinion.get("verdict", "neutral"),
+            "rationale": opinion.get("rationale", "N/A")
+        }
+    except Exception as e:
+        logger.error(f"Web fusion processing error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Web fusion processing error: {str(e)}")
 
 @app.post("/code-build")
-async def code_build(payload: dict = Body(...)):
+async def code_build(payload: Dict[str, Any] = Body(...)):
+    """Generate code from prompt."""
     prompt = payload.get("prompt")
     if not prompt:
-        return {"error": "Missing prompt"}
+        raise HTTPException(status_code=400, detail="Missing prompt")
     
     try:
         from sully_engine.code_tools.codebrain import CodeBrain
         brain = CodeBrain()
+        logger.info(f"Code generation requested: {prompt[:50]}...")
+        
         design = brain.interpret_goal(prompt)
         plan = brain.generate_code_plan(design)
         code = brain.synthesize_code(plan)
         explanation = brain.explain_choices(plan)
+        
         return {
             "design": design,
             "code": code,
             "explanation": explanation
         }
+    except ImportError:
+        logger.error("CodeBrain module not available")
+        raise HTTPException(status_code=501, detail="Code generation functionality not available")
     except Exception as e:
-        return {"error": f"Code generation error: {str(e)}"}
+        logger.error(f"Code generation error: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Code generation error: {str(e)}")

@@ -1674,7 +1674,9 @@ class Sully:
             return summary
         except Exception as e:
             self.logger.error(f"PDF image extraction error: {str(e)}")
-            return f"Error extracting images: {str(e)}"def word_count(self):
+            return f"Error extracting images: {str(e)}"
+
+def word_count(self):
         """Return the number of concepts in Sully's lexicon."""
         self._track_module_access("codex")
         
