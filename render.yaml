@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sully
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn sully_api:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
