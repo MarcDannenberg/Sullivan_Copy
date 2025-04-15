@@ -1948,7 +1948,7 @@ async def code_build(payload: dict = Body(...)):
             "explanation": explanation
         }
     except Exception as e:
-        return {"error": f"Code generation error: {str(e)}")}# Step 1: Retrieve relevant memories
+        return {"error": f"Code generation error: {str(e)}"}# Step 1: Retrieve relevant memories
         memories = []
         if retrieve_memories and hasattr(s, "search_memory"):
             memories = s.search_memory(message, limit=3)
