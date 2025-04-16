@@ -11,12 +11,36 @@ import io
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 import numpy as np
 import re
+import logging
+import tempfile
+import requests
+from pathlib import Path
 
-# Note: In a production system, you might use libraries like:
-# - TensorFlow/PyTorch for neural network processing
-# - OpenCV for computer vision tasks
-# - CLIP or similar models for image-text understanding
-# For this implementation, we'll define interfaces that could connect to such systems
+# Import computer vision libraries
+try:
+    import cv2
+    import torch
+    import torchvision
+    from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+    from torchvision.transforms import functional as F
+    HAS_TORCH = True
+except ImportError:
+    logging.warning("PyTorch or torchvision not available. Using fallback object detection.")
+    HAS_TORCH = False
+
+try:
+    from transformers import AutoFeatureExtractor, AutoModelForImageClassification, DetrImageProcessor, DetrForObjectDetection
+    HAS_TRANSFORMERS = True
+except ImportError:
+    logging.warning("Transformers library not available. Using fallback for scene classification.")
+    HAS_TRANSFORMERS = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class VisualObject:
     """
@@ -265,49 +289,41 @@ class VisualScene:
 
 class ObjectRecognitionModule:
     """
-    Module for recognizing objects in images.
+    Module for recognizing objects in images using modern computer vision techniques.
     """
+    
+    # COCO dataset class names for the Faster R-CNN model
+    COCO_CLASSES = [
+        'background', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+        'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 
+        'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 
+        'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 
+        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 
+        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 
+        'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 
+        'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant', 
+        'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 
+        'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 
+        'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    ]
     
     def __init__(self, model_path: Optional[str] = None):
         """
         Initialize the object recognition module.
         
         Args:
-            model_path: Optional path to a recognition model
+            model_path: Optional path to a custom recognition model
         """
         self.model_path = model_path
         self.initialized = False
-        self.supported_labels = self._load_supported_labels()
+        self.model = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if HAS_TORCH else None
+        self.color_analyzer = ColorAnalyzer()
         
-        # Dictionary to map model prediction indices to human-readable labels
-        self.label_map = {i: label for i, label in enumerate(self.supported_labels)}
-        
-    def _load_supported_labels(self) -> List[str]:
-        """
-        Load supported object labels.
-        
-        Returns:
-            List of supported labels
-        """
-        # In a real implementation, this would load from the model
-        # For this implementation, we'll use a predefined list
-        base_labels = [
-            "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-            "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-            "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-            "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
-            "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
-            "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
-            "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana",
-            "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza",
-            "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table",
-            "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
-            "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock",
-            "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
-        ]
-        
-        return base_labels
-        
+        # Initialize model if PyTorch is available
+        if HAS_TORCH:
+            self.load_model()
+            
     def load_model(self) -> bool:
         """
         Load the recognition model.
@@ -315,14 +331,66 @@ class ObjectRecognitionModule:
         Returns:
             Success indicator
         """
-        # In a real implementation, this would load a machine learning model
-        # For this implementation, we'll simulate successful loading
-        self.initialized = True
-        return True
+        if not HAS_TORCH:
+            logger.warning("PyTorch not available. Object detection will use fallback implementation.")
+            self.initialized = False
+            return False
+            
+        try:
+            if self.model_path:
+                # Load custom model if path provided
+                self.model = torch.load(self.model_path, map_location=self.device)
+            else:
+                # Use pre-trained Faster R-CNN model
+                weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+                self.model = fasterrcnn_resnet50_fpn(weights=weights, box_score_thresh=0.5)
+                
+            self.model.to(self.device)
+            self.model.eval()
+            self.initialized = True
+            logger.info(f"Object recognition model loaded successfully on {self.device}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load object recognition model: {str(e)}")
+            self.initialized = False
+            return False
+    
+    def _prepare_image(self, image_input: Union[str, Image.Image, np.ndarray]) -> Optional[Image.Image]:
+        """
+        Prepare and normalize image for processing.
         
+        Args:
+            image_input: Input image (path, PIL Image, or numpy array)
+            
+        Returns:
+            Prepared PIL image or None if preparation fails
+        """
+        try:
+            if isinstance(image_input, str):
+                # Handle URLs and local file paths
+                if image_input.startswith(('http://', 'https://')):
+                    response = requests.get(image_input, stream=True)
+                    response.raise_for_status()
+                    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+                elif os.path.exists(image_input):
+                    image = Image.open(image_input).convert("RGB")
+                else:
+                    raise ValueError(f"Image path not found: {image_input}")
+            elif isinstance(image_input, Image.Image):
+                image = image_input.convert("RGB")
+            elif isinstance(image_input, np.ndarray):
+                image = Image.fromarray(np.uint8(image_input)).convert("RGB")
+            else:
+                raise ValueError("Unsupported image type")
+                
+            return image
+        except Exception as e:
+            logger.error(f"Image preparation failed: {str(e)}")
+            return None
+            
     def detect_objects(self, image: Union[str, Image.Image, np.ndarray]) -> List[VisualObject]:
         """
-        Detect objects in an image.
+        Detect objects in an image using a deep learning model.
         
         Args:
             image: Input image (path, PIL Image, or numpy array)
@@ -330,72 +398,305 @@ class ObjectRecognitionModule:
         Returns:
             List of detected objects
         """
-        # Ensure model is loaded
-        if not self.initialized:
-            self.load_model()
-            
         # Prepare image
-        try:
-            if isinstance(image, str):
-                # Load from path
-                if os.path.exists(image):
-                    img = Image.open(image)
-                else:
-                    raise ValueError(f"Image path not found: {image}")
-            elif isinstance(image, Image.Image):
-                # Use PIL image directly
-                img = image
-            elif isinstance(image, np.ndarray):
-                # Convert numpy array to PIL Image
-                img = Image.fromarray(image.astype('uint8'))
-            else:
-                raise ValueError("Unsupported image type")
-        except Exception as e:
-            return []  # Return empty list on error
+        img = self._prepare_image(image)
+        if img is None:
+            return []
             
-        # For this implementation, we'll simulate object detection
-        # In a real implementation, this would use the loaded model
-        
         # Get image dimensions
         width, height = img.size
         
-        # Simulate random object detection
-        # In a real system, this would call a proper object detection model
+        # Use PyTorch model if available
+        if self.initialized and HAS_TORCH:
+            try:
+                # Convert image to tensor
+                img_tensor = F.to_tensor(img).unsqueeze(0).to(self.device)
+                
+                # Perform inference
+                with torch.no_grad():
+                    predictions = self.model(img_tensor)
+                    
+                # Process results
+                detected_objects = []
+                
+                for idx in range(len(predictions[0]['boxes'])):
+                    score = predictions[0]['scores'][idx].item()
+                    if score > 0.5:  # Confidence threshold
+                        box = predictions[0]['boxes'][idx].cpu().numpy()
+                        label_idx = predictions[0]['labels'][idx].item()
+                        
+                        # Get class label
+                        if 0 <= label_idx < len(self.COCO_CLASSES):
+                            label = self.COCO_CLASSES[label_idx]
+                        else:
+                            label = f"object_{label_idx}"
+                        
+                        # Normalize box coordinates
+                        x1, y1, x2, y2 = box
+                        norm_box = [
+                            x1 / width,
+                            y1 / height,
+                            x2 / width,
+                            y2 / height
+                        ]
+                        
+                        # Extract object crop for attribute analysis
+                        crop = img.crop((x1, y1, x2, y2))
+                        
+                        # Analyze attributes (like color)
+                        attributes = {}
+                        if label in ["car", "shirt", "book", "bicycle", "chair", "couch", "cup", "vase"]:
+                            # These objects typically have distinctive colors
+                            dominant_color, color_name = self.color_analyzer.analyze(crop)
+                            attributes["color"] = color_name
+                            attributes["color_rgb"] = dominant_color
+                            
+                        # Estimate size relative to image
+                        area_ratio = ((x2 - x1) * (y2 - y1)) / (width * height)
+                        if area_ratio < 0.05:
+                            attributes["size"] = "small"
+                        elif area_ratio < 0.15:
+                            attributes["size"] = "medium"
+                        else:
+                            attributes["size"] = "large"
+                            
+                        # Create the visual object
+                        obj = VisualObject(
+                            label=label,
+                            confidence=score,
+                            bbox=norm_box,
+                            attributes=attributes
+                        )
+                        
+                        detected_objects.append(obj)
+                        
+                return detected_objects
+                
+            except Exception as e:
+                logger.error(f"Object detection failed: {str(e)}")
+                # Fall back to OpenCV-based detection if PyTorch fails
+                return self._detect_with_opencv(img)
+        else:
+            # Use OpenCV-based detection as fallback
+            return self._detect_with_opencv(img)
+    
+    def _detect_with_opencv(self, img: Image.Image) -> List[VisualObject]:
+        """
+        Fallback object detection using OpenCV.
+        
+        Args:
+            img: PIL Image
+            
+        Returns:
+            List of detected objects
+        """
         detected_objects = []
         
-        # Simulate 2-5 random objects from our supported labels
-        num_objects = np.random.randint(2, 6)
-        for _ in range(num_objects):
-            # Select random label
-            label_idx = np.random.randint(0, len(self.supported_labels))
-            label = self.supported_labels[label_idx]
+        try:
+            # Convert PIL Image to OpenCV format
+            cv_img = np.array(img)
+            cv_img = cv_img[:, :, ::-1].copy()  # RGB to BGR
             
-            # Generate random confidence (biased toward high confidence)
-            confidence = 0.7 + 0.3 * np.random.random()
+            width, height = img.size
             
-            # Generate random bounding box
-            x1 = np.random.random() * 0.8
-            y1 = np.random.random() * 0.8
-            w = np.random.random() * 0.3 + 0.1  # width between 0.1 and 0.4
-            h = np.random.random() * 0.3 + 0.1  # height between 0.1 and 0.4
-            x2 = min(x1 + w, 1.0)
-            y2 = min(y1 + h, 1.0)
-            
-            # Create object with some random attributes
-            attributes = {"size": np.random.choice(["small", "medium", "large"])}
-            
-            # Add color attribute for some object types
-            if label in ["car", "shirt", "book", "bicycle"]:
-                attributes["color"] = np.random.choice(["red", "blue", "green", "yellow", "black", "white"])
+            # Use OpenCV's DNN module with a pre-trained model
+            try:
+                # Use YOLO or SSD if available
+                config_file = os.environ.get("OPENCV_DNN_CONFIG", "")
+                weights_file = os.environ.get("OPENCV_DNN_WEIGHTS", "")
                 
-            # Create the visual object
-            obj = VisualObject(
-                label=label,
-                confidence=confidence,
-                bbox=[x1, y1, x2, y2],
-                attributes=attributes
-            )
+                if os.path.exists(config_file) and os.path.exists(weights_file):
+                    net = cv2.dnn.readNetFromDarknet(config_file, weights_file)
+                    layer_names = net.getLayerNames()
+                    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+                    
+                    # Prepare image for YOLO
+                    blob = cv2.dnn.blobFromImage(cv_img, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+                    net.setInput(blob)
+                    outs = net.forward(output_layers)
+                    
+                    class_ids = []
+                    confidences = []
+                    boxes = []
+                    
+                    for out in outs:
+                        for detection in out:
+                            scores = detection[5:]
+                            class_id = np.argmax(scores)
+                            confidence = scores[class_id]
+                            if confidence > 0.5:
+                                # Object detected
+                                center_x = int(detection[0] * width)
+                                center_y = int(detection[1] * height)
+                                w = int(detection[2] * width)
+                                h = int(detection[3] * height)
+                                
+                                # Rectangle coordinates
+                                x = int(center_x - w / 2)
+                                y = int(center_y - h / 2)
+                                
+                                boxes.append([x, y, w, h])
+                                confidences.append(float(confidence))
+                                class_ids.append(class_id)
+                    
+                    # Apply non-maximum suppression
+                    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+                    
+                    for i in range(len(boxes)):
+                        if i in indexes:
+                            x, y, w, h = boxes[i]
+                            label = self.COCO_CLASSES[class_ids[i]] if class_ids[i] < len(self.COCO_CLASSES) else f"object_{class_ids[i]}"
+                            confidence = confidences[i]
+                            
+                            # Normalize coordinates
+                            norm_box = [
+                                max(0, x) / width,
+                                max(0, y) / height,
+                                min(width, x + w) / width,
+                                min(height, y + h) / height
+                            ]
+                            
+                            # Extract object crop for attribute analysis
+                            crop = img.crop((max(0, x), max(0, y), min(width, x + w), min(height, y + h)))
+                            
+                            # Analyze attributes
+                            attributes = {"size": "medium"}  # Default
+                            
+                            # Analyze color for certain objects
+                            if label in ["car", "shirt", "book", "bicycle", "chair", "couch"]:
+                                dominant_color, color_name = self.color_analyzer.analyze(crop)
+                                attributes["color"] = color_name
+                                
+                            # Create visual object
+                            obj = VisualObject(
+                                label=label,
+                                confidence=confidence,
+                                bbox=norm_box,
+                                attributes=attributes
+                            )
+                            
+                            detected_objects.append(obj)
+                else:
+                    # Fall back to simple CV-based detection if YOLO not available
+                    detected_objects = self._basic_cv_detection(cv_img, img)
+            except Exception as e:
+                logger.error(f"OpenCV DNN detection failed: {str(e)}")
+                detected_objects = self._basic_cv_detection(cv_img, img)
+                
+            return detected_objects
+                
+        except Exception as e:
+            logger.error(f"Fallback detection failed: {str(e)}")
+            return []
+    
+    def _basic_cv_detection(self, cv_img, pil_img):
+        """
+        Basic detection using OpenCV traditional methods.
+        """
+        detected_objects = []
+        width, height = pil_img.size
+        
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
             
+            # Try to detect faces as a simple fallback
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            
+            for (x, y, w, h) in faces:
+                # Normalize coordinates
+                norm_box = [
+                    max(0, x) / width,
+                    max(0, y) / height,
+                    min(width, x + w) / width,
+                    min(height, y + h) / height
+                ]
+                
+                # Create visual object
+                obj = VisualObject(
+                    label="person",
+                    confidence=0.8,
+                    bbox=norm_box,
+                    attributes={"size": "medium"}
+                )
+                
+                detected_objects.append(obj)
+                
+            # Simple contour-based detection for other objects
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, threshold = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                
+                # Filter small contours
+                if area > 1000:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Filter out potential duplicates with faces
+                    is_duplicate = False
+                    for obj in detected_objects:
+                        obj_x1, obj_y1, obj_x2, obj_y2 = [int(coord * (width if i % 2 == 0 else height)) 
+                                                        for i, coord in enumerate(obj.bbox)]
+                        overlap = max(0, min(x+w, obj_x2) - max(x, obj_x1)) * max(0, min(y+h, obj_y2) - max(y, obj_y1))
+                        if overlap / (w * h) > 0.5:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        # Normalize coordinates
+                        norm_box = [
+                            max(0, x) / width,
+                            max(0, y) / height,
+                            min(width, x + w) / width,
+                            min(height, y + h) / height
+                        ]
+                        
+                        # Extract object crop for attribute analysis
+                        crop = pil_img.crop((max(0, x), max(0, y), min(width, x + w), min(height, y + h)))
+                        
+                        # Analyze color
+                        dominant_color, color_name = self.color_analyzer.analyze(crop)
+                        
+                        # Determine label based on shape analysis
+                        approx = cv2.approxPolyDP(contour, 0.04 * cv2.arcLength(contour, True), True)
+                        
+                        if len(approx) == 4:
+                            label = "book"  # Or could be box/table
+                        elif len(approx) > 8:
+                            label = "ball"
+                        else:
+                            # Default based on position
+                            if y < height/3:
+                                label = "lamp"
+                            elif w > width/2:
+                                label = "table"
+                            else:
+                                label = "object"
+                                
+                        # Create visual object
+                        obj = VisualObject(
+                            label=label,
+                            confidence=0.6,
+                            bbox=norm_box,
+                            attributes={"color": color_name, "size": "medium"}
+                        )
+                        
+                        detected_objects.append(obj)
+                        
+        except Exception as e:
+            logger.error(f"Basic CV detection failed: {str(e)}")
+            
+        # If we still have no objects, add at least one generic object
+        if not detected_objects:
+            obj = VisualObject(
+                label="object",
+                confidence=0.5,
+                bbox=[0.3, 0.3, 0.7, 0.7],
+                attributes={"size": "medium"}
+            )
             detected_objects.append(obj)
             
         return detected_objects
@@ -413,19 +714,8 @@ class ObjectRecognitionModule:
             Annotated image
         """
         # Prepare image
-        try:
-            if isinstance(image, str):
-                # Load from path
-                if os.path.exists(image):
-                    img = Image.open(image).convert("RGB")
-                else:
-                    raise ValueError(f"Image path not found: {image}")
-            elif isinstance(image, Image.Image):
-                # Use PIL image directly
-                img = image.convert("RGB")
-            else:
-                raise ValueError("Unsupported image type")
-        except Exception as e:
+        img = self._prepare_image(image)
+        if img is None:
             # Return blank image on error
             return Image.new("RGB", (400, 300), color=(240, 240, 240))
             
@@ -435,9 +725,24 @@ class ObjectRecognitionModule:
         
         # Try to load a font
         try:
-            font = ImageFont.truetype("arial.ttf", 14)
-        except Exception:
-            # Use default font if arial not available
+            font_path = os.path.join(os.path.dirname(__file__), "fonts", "arial.ttf")
+            if os.path.exists(font_path):
+                font = ImageFont.truetype(font_path, 14)
+            else:
+                # Try system fonts
+                system_fonts = [
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux
+                    "/Library/Fonts/Arial.ttf",  # macOS
+                    "C:\\Windows\\Fonts\\arial.ttf"  # Windows
+                ]
+                for sys_font in system_fonts:
+                    if os.path.exists(sys_font):
+                        font = ImageFont.truetype(sys_font, 14)
+                        break
+                else:
+                    font = ImageFont.load_default()
+        except Exception as e:
+            logger.warning(f"Failed to load font: {str(e)}")
             font = ImageFont.load_default()
             
         # Draw each detection
@@ -462,19 +767,22 @@ class ObjectRecognitionModule:
             # Draw bounding box
             draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
             
-            # Draw label
-            label_text = f"{obj.label} ({obj.confidence:.2f})"
+            # Prepare label text
+            color_text = f" ({obj.attributes.get('color', '')})" if 'color' in obj.attributes else ""
+            label_text = f"{obj.label}{color_text} ({obj.confidence:.2f})"
             
-            # In newer versions of PIL, textsize requires the font parameter
+            # Measure text for background
             try:
-                text_width, text_height = draw.textsize(label_text, font=font)
-            except TypeError:
-                # For older PIL versions that don't require the font parameter
-                try:
-                    text_width, text_height = draw.textsize(label_text)
-                except Exception:
-                    # Fallback to estimated size
-                    text_width, text_height = len(label_text) * 7, 15
+                # Different versions of PIL have different APIs
+                if hasattr(draw, "textbbox"):
+                    text_bbox = draw.textbbox((0, 0), label_text, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                else:
+                    text_width, text_height = draw.textsize(label_text, font=font)
+            except Exception:
+                # Fallback to estimated size
+                text_width, text_height = len(label_text) * 7, 15
             
             # Draw background for text
             draw.rectangle(
@@ -486,6 +794,331 @@ class ObjectRecognitionModule:
             draw.text((x1 + 2, y1 - text_height - 2), label_text, fill=(0, 0, 0), font=font)
             
         return img
+
+
+class ColorAnalyzer:
+    """
+    Module for analyzing colors in images.
+    """
+    
+    def __init__(self):
+        """Initialize the color analyzer."""
+        # Define color name mapping
+        self.color_map = {
+            # Red shades
+            (255, 0, 0): "red",
+            (180, 0, 0): "dark red",
+            (255, 102, 102): "light red",
+            (128, 0, 0): "maroon",
+            # Green shades
+            (0, 255, 0): "green",
+            (0, 180, 0): "dark green",
+            (102, 255, 102): "light green",
+            (34, 139, 34): "forest green",
+            # Blue shades
+            (0, 0, 255): "blue",
+            (0, 0, 180): "dark blue",
+            (102, 102, 255): "light blue",
+            (0, 0, 128): "navy",
+            # Yellow shades
+            (255, 255, 0): "yellow",
+            (255, 215, 0): "gold",
+            (255, 255, 102): "light yellow",
+            # Purple shades
+            (128, 0, 128): "purple",
+            (186, 85, 211): "medium orchid",
+            (153, 50, 204): "dark orchid",
+            # Orange shades
+            (255, 165, 0): "orange",
+            (255, 127, 80): "coral",
+            (255, 69, 0): "red-orange",
+            # Brown shades
+            (165, 42, 42): "brown",
+            (210, 105, 30): "chocolate",
+            (139, 69, 19): "saddle brown",
+            # White and black
+            (255, 255, 255): "white",
+            (0, 0, 0): "black",
+            # Gray shades
+            (128, 128, 128): "gray",
+            (169, 169, 169): "dark gray",
+            (211, 211, 211): "light gray",
+            # Pink shades
+            (255, 192, 203): "pink",
+            (255, 105, 180): "hot pink",
+            (219, 112, 147): "pale violet red",
+            # Cyan shades
+            (0, 255, 255): "cyan",
+            (224, 255, 255): "light cyan",
+            (0, 206, 209): "dark turquoise",
+        }
+    
+    def analyze(self, image: Image.Image) -> Tuple[Tuple[int, int, int], str]:
+        """
+        Analyze the dominant color in an image.
+        
+        Args:
+            image: PIL Image
+            
+        Returns:
+            Tuple containing (RGB tuple, color name)
+        """
+        try:
+            # Resize image for faster processing
+            img = image.copy()
+            img.thumbnail((100, 100))
+            
+            # Convert to RGB if not already
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            # Get colors
+            colors = img.getcolors(maxcolors=10000)
+            if not colors:
+                return (128, 128, 128), "gray"
+                
+            # Find most common color
+            dominant_color = max(colors, key=lambda x: x[0])[1]
+            
+            # Find closest color name
+            color_name = self._get_closest_color_name(dominant_color)
+            
+            return dominant_color, color_name
+        except Exception as e:
+            logger.error(f"Color analysis failed: {str(e)}")
+            return (128, 128, 128), "gray"
+    
+    def _get_closest_color_name(self, rgb: Tuple[int, int, int]) -> str:
+        """
+        Get the closest named color to an RGB value.
+        
+        Args:
+            rgb: RGB color tuple
+            
+        Returns:
+            Color name
+        """
+        min_distance = float('inf')
+        closest_name = "unknown"
+        
+        for color_rgb, name in self.color_map.items():
+            distance = self._color_distance(rgb, color_rgb)
+            if distance < min_distance:
+                min_distance = distance
+                closest_name = name
+                
+        return closest_name
+    
+    def _color_distance(self, rgb1: Tuple[int, int, int], rgb2: Tuple[int, int, int]) -> float:
+        """
+        Calculate distance between two RGB colors.
+        
+        Args:
+            rgb1: First RGB color
+            rgb2: Second RGB color
+            
+        Returns:
+            Color distance
+        """
+        r1, g1, b1 = rgb1
+        r2, g2, b2 = rgb2
+        
+        # Weighted Euclidean distance (human eye is more sensitive to green)
+        return ((r2-r1)*0.30)**2 + ((g2-g1)*0.59)**2 + ((b2-b1)*0.11)**2
+
+
+class SceneClassifier:
+    """
+    Module for classifying scene types using deep learning.
+    """
+    
+    def __init__(self):
+        """Initialize the scene classifier."""
+        self.model = None
+        self.processor = None
+        self.initialized = False
+        self.scene_categories = [
+            "bathroom", "bedroom", "conference_room", "dining_room", "highway",
+            "kitchen", "living_room", "mountain", "office", "street", "forest",
+            "coast", "field", "store", "urban"
+        ]
+        
+        # Initialize if transformers available
+        if HAS_TRANSFORMERS:
+            self.load_model()
+    
+    def load_model(self) -> bool:
+        """
+        Load scene classification model.
+        
+        Returns:
+            Success indicator
+        """
+        if not HAS_TRANSFORMERS:
+            logger.warning("Transformers library not available. Scene classification will use fallback.")
+            return False
+            
+        try:
+            # Load a pre-trained scene classification model
+            # Most scene classification models use ResNet or ViT architecture
+            self.processor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-50")
+            self.model = AutoModelForImageClassification.from_pretrained("microsoft/resnet-50")
+            
+            self.initialized = True
+            logger.info("Scene classification model loaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load scene classification model: {str(e)}")
+            self.initialized = False
+            return False
+    
+    def classify(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        Classify the scene type in an image.
+        
+        Args:
+            image: PIL Image
+            
+        Returns:
+            Dictionary with classification results
+        """
+        # Use transformers model if available
+        if self.initialized and HAS_TRANSFORMERS:
+            try:
+                # Process image
+                inputs = self.processor(images=image, return_tensors="pt")
+                
+                # Get predictions
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits
+                    predicted_class_idx = logits.argmax(-1).item()
+                
+                # Map to category name
+                categories = self.model.config.id2label
+                category = categories[predicted_class_idx]
+                confidence = torch.softmax(logits, dim=-1)[0, predicted_class_idx].item()
+                
+                return {
+                    "scene_type": category,
+                    "confidence": confidence,
+                    "method": "deep_learning"
+                }
+            except Exception as e:
+                logger.error(f"Scene classification failed: {str(e)}")
+                return self._fallback_classify(image)
+        else:
+            # Use fallback method
+            return self._fallback_classify(image)
+    
+    def _fallback_classify(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        Fallback scene classification using color and texture analysis.
+        
+        Args:
+            image: PIL Image
+            
+        Returns:
+            Classification results
+        """
+        try:
+            # Resize for faster processing
+            img = image.copy()
+            img.thumbnail((200, 200))
+            
+            # Convert to RGB
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            # Convert to numpy array
+            img_array = np.array(img)
+            
+            # Simple color analysis
+            avg_color = np.mean(img_array, axis=(0, 1))
+            
+            # Extract HSV for better color analysis
+            hsv_img = None
+            try:
+                # Convert to HSV using OpenCV if available
+                if 'cv2' in globals():
+                    bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                    hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+            except Exception:
+                hsv_img = None
+                
+            # Extract basic features
+            brightness = np.mean(img_array)
+            saturation = np.std(img_array)
+            
+            # Texture analysis (simple entropy)
+            try:
+                gray = np.mean(img_array, axis=2).astype(np.uint8)
+                texture_entropy = np.std(gray)
+            except Exception:
+                texture_entropy = 0
+                
+            # Color histogram
+            try:
+                hist_r = np.histogram(img_array[:,:,0], bins=8, range=(0, 256))[0]
+                hist_g = np.histogram(img_array[:,:,1], bins=8, range=(0, 256))[0]
+                hist_b = np.histogram(img_array[:,:,2], bins=8, range=(0, 256))[0]
+                
+                # Normalize histograms
+                hist_r = hist_r / np.sum(hist_r)
+                hist_g = hist_g / np.sum(hist_g)
+                hist_b = hist_b / np.sum(hist_b)
+                
+                # Combine histograms
+                hist = np.concatenate([hist_r, hist_g, hist_b])
+            except Exception:
+                hist = np.ones(24) / 24
+                
+            # Simple rule-based classification
+            # High blue often indicates outdoor scenes
+            blue_ratio = avg_color[2] / (avg_color[0] + avg_color[1] + 1)
+            
+            # High green often indicates nature scenes
+            green_ratio = avg_color[1] / (avg_color[0] + avg_color[2] + 1)
+            
+            # Determine scene type based on features
+            if blue_ratio > 1.2 and brightness > 150:
+                scene_type = "coast" if green_ratio < 0.8 else "mountain"
+                confidence = 0.6
+            elif green_ratio > 1.2:
+                scene_type = "forest"
+                confidence = 0.7
+            elif brightness < 80:
+                scene_type = "indoor" if texture_entropy > 40 else "urban"
+                confidence = 0.5
+            elif brightness > 200:
+                scene_type = "snow" if np.std(img_array) < 40 else "beach"
+                confidence = 0.6
+            elif texture_entropy > 50:
+                scene_type = "urban"
+                confidence = 0.5
+            else:
+                scene_type = "indoor"
+                confidence = 0.4
+                
+            return {
+                "scene_type": scene_type,
+                "confidence": confidence,
+                "method": "color_analysis",
+                "features": {
+                    "brightness": float(brightness),
+                    "texture": float(texture_entropy),
+                    "blue_ratio": float(blue_ratio),
+                    "green_ratio": float(green_ratio)
+                }
+            }
+                
+        except Exception as e:
+            logger.error(f"Fallback scene classification failed: {str(e)}")
+            return {
+                "scene_type": "unknown",
+                "confidence": 0.3,
+                "method": "default"
+            }
 
 
 class SceneUnderstandingModule:
@@ -500,9 +1133,11 @@ class SceneUnderstandingModule:
             "touching", "near", "far_from", "in_front_of", "behind",
             "centered", "aligned_with"
         ]
+        self.scene_classifier = SceneClassifier()
         
     def analyze_scene(self, objects: List[VisualObject], 
-                     image_width: int, image_height: int) -> VisualScene:
+                     image_width: int, image_height: int,
+                     image: Optional[Image.Image] = None) -> VisualScene:
         """
         Analyze a scene with detected objects to understand relationships.
         
@@ -510,6 +1145,7 @@ class SceneUnderstandingModule:
             objects: Detected objects
             image_width: Image width
             image_height: Image height
+            image: Optional original image for scene classification
             
         Returns:
             Analyzed visual scene
@@ -536,7 +1172,25 @@ class SceneUnderstandingModule:
         # Add global scene attributes
         scene.global_attributes["object_count"] = len(objects)
         scene.global_attributes["primary_objects"] = self._identify_primary_objects(objects)
-        scene.global_attributes["scene_type"] = self._classify_scene_type(objects)
+        
+        # Classify scene type
+        if image is not None:
+            # Use scene classifier if image is available
+            classification = self.scene_classifier.classify(image)
+            scene.global_attributes["scene_type"] = classification["scene_type"]
+            scene.global_attributes["scene_confidence"] = classification["confidence"]
+            scene.global_attributes["classification_method"] = classification["method"]
+        else:
+            # Fall back to object-based classification
+            scene.global_attributes["scene_type"] = self._classify_scene_type(objects)
+            scene.global_attributes["classification_method"] = "object_based"
+            
+        # Add additional scene metadata
+        scene.global_attributes["analysis_time"] = datetime.now().isoformat()
+        scene.global_attributes["object_density"] = len(objects) / (image_width * image_height / 1000000)  # Objects per million pixels
+        
+        # Detect potential activities
+        scene.global_attributes["activities"] = self._detect_activities(objects)
         
         return scene
         
@@ -627,6 +1281,17 @@ class SceneUnderstandingModule:
             if 0 < overlap_area < 0.05 * min(area1, area2):
                 relationships.append(("touching", 0.7))
                 
+        # Check "aligned_with" relationship (horizontally or vertically)
+        horizontal_aligned = abs(center_y1 - center_y2) < 0.05
+        vertical_aligned = abs(center_x1 - center_x2) < 0.05
+        
+        if horizontal_aligned and not vertical_aligned:
+            relationships.append(("horizontally_aligned_with", 0.8))
+        elif vertical_aligned and not horizontal_aligned:
+            relationships.append(("vertically_aligned_with", 0.8))
+        elif horizontal_aligned and vertical_aligned:
+            relationships.append(("centered_with", 0.9))
+                
         return relationships
         
     def _identify_primary_objects(self, objects: List[VisualObject]) -> List[str]:
@@ -642,18 +1307,42 @@ class SceneUnderstandingModule:
         if not objects:
             return []
             
-        # Sort objects by size and confidence
-        sorted_objects = sorted(
-            objects,
-            key=lambda obj: (
-                (obj.bbox[2] - obj.bbox[0]) * (obj.bbox[3] - obj.bbox[1]),  # Area
-                obj.confidence
-            ),
-            reverse=True
-        )
+        # Calculate importance score based on multiple factors
+        object_importance = []
         
-        # Return top 3 objects
-        return [obj.label for obj in sorted_objects[:3]]
+        for obj in objects:
+            # Calculate area
+            x1, y1, x2, y2 = obj.bbox
+            area = (x2 - x1) * (y2 - y1)
+            
+            # Calculate centrality
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            centrality = 1 - (((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2) ** 0.5)
+            
+            # Consider confidence
+            confidence = obj.confidence
+            
+            # Define intrinsic importance for certain object types
+            intrinsic_importance = 1.0
+            
+            if obj.label == "person":
+                intrinsic_importance = 1.5
+            elif obj.label in ["car", "bicycle", "motorcycle", "truck", "bus", "train", "airplane"]:
+                intrinsic_importance = 1.3
+            elif obj.label in ["cat", "dog", "horse", "elephant", "bear", "giraffe", "zebra"]:
+                intrinsic_importance = 1.2
+                
+            # Calculate overall importance
+            importance = (area * 3 + centrality * 2 + confidence * 1.5) * intrinsic_importance
+            
+            object_importance.append((obj, importance))
+            
+        # Sort by importance score
+        object_importance.sort(key=lambda x: x[1], reverse=True)
+        
+        # Return top 3 (or fewer if not enough objects)
+        return [obj.label for obj, _ in object_importance[:min(3, len(object_importance))]]
         
     def _classify_scene_type(self, objects: List[VisualObject]) -> str:
         """
@@ -669,30 +1358,197 @@ class SceneUnderstandingModule:
         if not objects:
             return "unknown"
             
-        # Count object types
+        # Count object types and group by categories
         object_types = {}
+        category_counts = {
+            "people": 0,
+            "vehicles": 0,
+            "furniture": 0,
+            "nature": 0,
+            "animals": 0,
+            "food": 0,
+            "electronics": 0,
+            "kitchenware": 0,
+            "sports": 0
+        }
+        
+        # Define category mappings
+        category_mappings = {
+            "people": ["person"],
+            "vehicles": ["car", "truck", "bus", "motorcycle", "bicycle", "train", "airplane", "boat"],
+            "furniture": ["chair", "couch", "bed", "table", "desk", "bench", "bookshelf", "cabinet"],
+            "nature": ["tree", "plant", "flower", "grass", "mountain", "rock", "water"],
+            "animals": ["cat", "dog", "bird", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"],
+            "food": ["banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake"],
+            "electronics": ["tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven"],
+            "kitchenware": ["bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "plate"],
+            "sports": ["frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket"]
+        }
+        
+        # Count objects by type and category
         for obj in objects:
+            # Count by specific type
             if obj.label not in object_types:
                 object_types[obj.label] = 0
             object_types[obj.label] += 1
             
-        # Check for common scene types
-        if "person" in object_types and object_types["person"] >= 2:
+            # Count by category
+            for category, labels in category_mappings.items():
+                if obj.label in labels:
+                    category_counts[category] += 1
+                    break
+                    
+        # Determine the dominant category
+        dominant_category = max(category_counts.items(), key=lambda x: x[1])
+        
+        # Apply classification rules
+        if dominant_category[0] == "people" and dominant_category[1] >= 2:
             return "social"
             
-        if any(label in object_types for label in ["car", "truck", "bus", "motorcycle"]):
-            return "transportation"
-            
-        if any(label in object_types for label in ["chair", "couch", "bed", "table"]):
-            return "indoor"
-            
-        if any(label in object_types for label in ["tree", "plant", "flower", "grass"]):
-            return "nature"
-            
-        if any(label in object_types for label in ["food", "fruit", "vegetable", "dish"]):
+        if dominant_category[0] == "vehicles" and dominant_category[1] >= 1:
+            if "road" in object_types or "highway" in object_types:
+                return "road"
+            else:
+                return "transportation"
+                
+        if dominant_category[0] == "furniture" and dominant_category[1] >= 1:
+            if category_counts["kitchenware"] >= 1:
+                return "kitchen"
+            elif "bed" in object_types:
+                return "bedroom"
+            elif "couch" in object_types or "tv" in object_types:
+                return "living_room"
+            elif "dining table" in object_types:
+                return "dining_room"
+            else:
+                return "indoor"
+                
+        if dominant_category[0] == "nature" and dominant_category[1] >= 1:
+            if "tree" in object_types and object_types["tree"] >= 3:
+                return "forest"
+            elif "water" in object_types:
+                return "coast"
+            else:
+                return "nature"
+                
+        if dominant_category[0] == "food" and dominant_category[1] >= 2:
             return "food"
             
-        return "general"
+        if dominant_category[0] == "animals" and dominant_category[1] >= 1:
+            if category_counts["nature"] >= 1:
+                return "wildlife"
+            else:
+                return "animal"
+                
+        if dominant_category[0] == "electronics" and category_counts["furniture"] >= 1:
+            return "office"
+            
+        if dominant_category[0] == "sports" and dominant_category[1] >= 1:
+            return "sports"
+            
+        # Default fallback based on object count
+        if len(objects) == 0:
+            return "empty"
+        elif len(objects) <= 2:
+            return "minimal"
+        else:
+            return "general"
+    
+    def _detect_activities(self, objects: List[VisualObject]) -> List[Dict[str, Any]]:
+        """
+        Detect potential activities in the scene based on object combinations.
+        
+        Args:
+            objects: Detected objects
+            
+        Returns:
+            List of potential activities
+        """
+        activities = []
+        
+        # Get object labels
+        labels = [obj.label for obj in objects]
+        label_count = {}
+        for label in labels:
+            if label not in label_count:
+                label_count[label] = 0
+            label_count[label] += 1
+            
+        # Define activity patterns
+        activity_patterns = [
+            {
+                "name": "dining",
+                "confidence": 0.8,
+                "required": ["dining table"],
+                "optional": ["chair", "fork", "knife", "spoon", "bowl", "cup", "wine glass", "person"]
+            },
+            {
+                "name": "working",
+                "confidence": 0.7,
+                "required": ["laptop"],
+                "optional": ["person", "chair", "desk", "book", "cup"]
+            },
+            {
+                "name": "watching TV",
+                "confidence": 0.7,
+                "required": ["tv"],
+                "optional": ["person", "couch", "remote"]
+            },
+            {
+                "name": "cooking",
+                "confidence": 0.7,
+                "required": ["oven"],
+                "optional": ["person", "microwave", "refrigerator", "sink", "bowl", "knife"]
+            },
+            {
+                "name": "reading",
+                "confidence": 0.6,
+                "required": ["book"],
+                "optional": ["person", "chair", "couch"]
+            },
+            {
+                "name": "traveling",
+                "confidence": 0.7,
+                "required": ["car", "truck", "bus", "motorcycle", "train", "airplane"],  # Any one of these
+                "optional": ["person", "suitcase", "backpack"]
+            },
+            {
+                "name": "sports",
+                "confidence": 0.7,
+                "required": ["sports ball", "frisbee", "tennis racket", "baseball bat", "skateboard", "surfboard"],  # Any one of these
+                "optional": ["person"]
+            }
+        ]
+        
+        # Check for each activity pattern
+        for pattern in activity_patterns:
+            # For required items, check if any of them is present (OR logic)
+            required_present = False
+            for required_item in pattern["required"]:
+                if required_item in label_count:
+                    required_present = True
+                    break
+                    
+            if not required_present:
+                continue
+                
+            # Count optional items
+            optional_count = 0
+            for optional_item in pattern["optional"]:
+                if optional_item in label_count:
+                    optional_count += 1
+                    
+            # Calculate confidence based on optional items
+            optional_factor = min(1.0, optional_count / max(1, len(pattern["optional"])))
+            confidence = pattern["confidence"] * (0.7 + 0.3 * optional_factor)
+            
+            # Add to detected activities
+            activities.append({
+                "activity": pattern["name"],
+                "confidence": confidence
+            })
+            
+        return activities
         
     def describe_scene(self, scene: VisualScene) -> str:
         """
@@ -714,6 +1570,1632 @@ class SceneUnderstandingModule:
         primary_objects = scene.global_attributes.get("primary_objects", [])
         if primary_objects:
             description += f"The main elements are: {', '.join(primary_objects)}. "
+            
+        # Mention potential activities
+        activities = scene.global_attributes.get("activities", [])
+        if activities:
+            # Filter by confidence and sort
+            high_confidence_activities = [a for a in activities if a["confidence"] > 0.6]
+            if high_confidence_activities:
+                high_confidence_activities.sort(key=lambda x: x["confidence"], reverse=True)
+                activity_names = [a["activity"] for a in high_confidence_activities[:2]]
+                description += f"The scene suggests {' or '.join(activity_names)}. "
+            
+        # Describe spatial composition
+        spatial_description = self._generate_spatial_description(scene)
+        if spatial_description:
+            description += spatial_description
+            
+        return description
+        
+    def _generate_spatial_description(self, scene: VisualScene) -> str:
+        """
+        Generate description of spatial relationships in the scene.
+        
+        Args:
+            scene: The visual scene
+            
+        Returns:
+            Spatial description
+        """
+        if not scene.objects:
+            return ""
+            
+        # Find significant relationships
+        significant_relations = []
+        
+        for obj_id, obj in scene.objects.items():
+            for rel in obj.relationships:
+                if rel["confidence"] > 0.7:  # Only high-confidence relationships
+                    target_obj = scene.get_object_by_id(rel["target_id"])
+                    if target_obj:
+                        significant_relations.append(
+                            (obj.label, rel["type"], target_obj.label, rel["confidence"])
+                        )
+                        
+        # Sort by confidence
+        significant_relations.sort(# sully_engine/kernel_modules/visual_cognition.py
+# 🧠 Sully's Visual Cognition System - Understanding and reasoning about visual input
+
+from typing import Dict, List, Any, Optional, Union, Tuple
+import os
+import json
+import uuid
+import base64
+from datetime import datetime
+import io
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+import numpy as np
+import re
+import logging
+import tempfile
+import requests
+from pathlib import Path
+
+# Import computer vision libraries
+try:
+    import cv2
+    import torch
+    import torchvision
+    from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+    from torchvision.transforms import functional as F
+    HAS_TORCH = True
+except ImportError:
+    logging.warning("PyTorch or torchvision not available. Using fallback object detection.")
+    HAS_TORCH = False
+
+try:
+    from transformers import AutoFeatureExtractor, AutoModelForImageClassification, DetrImageProcessor, DetrForObjectDetection
+    HAS_TRANSFORMERS = True
+except ImportError:
+    logging.warning("Transformers library not available. Using fallback for scene classification.")
+    HAS_TRANSFORMERS = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class VisualObject:
+    """
+    Represents a detected object in a visual scene.
+    """
+    
+    def __init__(self, label: str, confidence: float, 
+               bbox: Optional[List[float]] = None,
+               attributes: Optional[Dict[str, Any]] = None):
+        """
+        Initialize a visual object.
+        
+        Args:
+            label: Object class label
+            confidence: Detection confidence (0.0-1.0)
+            bbox: Bounding box coordinates [x1, y1, x2, y2] normalized to 0-1
+            attributes: Additional object attributes
+        """
+        self.label = label
+        self.confidence = confidence
+        self.bbox = bbox or [0.0, 0.0, 0.0, 0.0]
+        self.attributes = attributes or {}
+        self.relationships = []  # Relationships to other objects
+        self.object_id = str(uuid.uuid4())
+        
+    def add_relationship(self, relation_type: str, target_object: 'VisualObject',
+                       confidence: float = 1.0) -> None:
+        """
+        Add a relationship to another object.
+        
+        Args:
+            relation_type: Type of relationship (e.g., "above", "contains", "next_to")
+            target_object: The related object
+            confidence: Relationship confidence (0.0-1.0)
+        """
+        self.relationships.append({
+            "type": relation_type,
+            "target_id": target_object.object_id,
+            "target_label": target_object.label,
+            "confidence": confidence
+        })
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to dictionary representation.
+        
+        Returns:
+            Dictionary representation
+        """
+        return {
+            "object_id": self.object_id,
+            "label": self.label,
+            "confidence": self.confidence,
+            "bbox": self.bbox,
+            "attributes": self.attributes,
+            "relationships": self.relationships
+        }
+
+
+class VisualScene:
+    """
+    Represents a complete visual scene with objects and their relationships.
+    """
+    
+    def __init__(self, scene_id: Optional[str] = None):
+        """
+        Initialize a visual scene.
+        
+        Args:
+            scene_id: Optional scene identifier
+        """
+        self.scene_id = scene_id or str(uuid.uuid4())
+        self.objects = {}  # object_id -> VisualObject
+        self.global_attributes = {}
+        self.creation_time = datetime.now()
+        self.source_image = None  # Could store path or reference to source
+        self.width = 0
+        self.height = 0
+        
+    def add_object(self, visual_object: VisualObject) -> None:
+        """
+        Add an object to the scene.
+        
+        Args:
+            visual_object: Object to add
+        """
+        self.objects[visual_object.object_id] = visual_object
+        
+    def get_object_by_id(self, object_id: str) -> Optional[VisualObject]:
+        """
+        Get an object by ID.
+        
+        Args:
+            object_id: Object identifier
+            
+        Returns:
+            The object or None if not found
+        """
+        return self.objects.get(object_id)
+        
+    def get_objects_by_label(self, label: str) -> List[VisualObject]:
+        """
+        Get objects by label.
+        
+        Args:
+            label: Object label to find
+            
+        Returns:
+            List of matching objects
+        """
+        return [obj for obj in self.objects.values() if obj.label.lower() == label.lower()]
+        
+    def set_dimensions(self, width: int, height: int) -> None:
+        """
+        Set scene dimensions.
+        
+        Args:
+            width: Scene width
+            height: Scene height
+        """
+        self.width = width
+        self.height = height
+        
+    def set_source(self, source: str) -> None:
+        """
+        Set source image reference.
+        
+        Args:
+            source: Source image reference
+        """
+        self.source_image = source
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to dictionary representation.
+        
+        Returns:
+            Dictionary representation
+        """
+        return {
+            "scene_id": self.scene_id,
+            "creation_time": self.creation_time.isoformat(),
+            "width": self.width,
+            "height": self.height,
+            "source_image": self.source_image,
+            "global_attributes": self.global_attributes,
+            "objects": [obj.to_dict() for obj in self.objects.values()]
+        }
+        
+    def describe(self) -> str:
+        """
+        Generate a textual description of the scene.
+        
+        Returns:
+            Scene description
+        """
+        # Count objects by type
+        object_counts = {}
+        for obj in self.objects.values():
+            label = obj.label
+            if label not in object_counts:
+                object_counts[label] = 0
+            object_counts[label] += 1
+            
+        # Generate overall description
+        description = f"Visual scene with {len(self.objects)} objects: "
+        
+        # List objects by type
+        object_descriptions = []
+        for label, count in object_counts.items():
+            if count == 1:
+                object_descriptions.append(f"1 {label}")
+            else:
+                object_descriptions.append(f"{count} {label}s")
+                
+        description += ", ".join(object_descriptions)
+        
+        # Add spatial relationships if available
+        if any(obj.relationships for obj in self.objects.values()):
+            description += ". Key relationships: "
+            
+            # Get top relationships
+            relationships = []
+            for obj in self.objects.values():
+                for rel in obj.relationships:
+                    if rel["confidence"] > 0.7:  # Only include high-confidence relationships
+                        relationships.append(
+                            f"{obj.label} {rel['type']} {rel['target_label']}"
+                        )
+                        
+            # Add top relationships to description
+            if relationships:
+                description += ", ".join(relationships[:3])
+                if len(relationships) > 3:
+                    description += f" and {len(relationships) - 3} more"
+                    
+        return description
+        
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> 'VisualScene':
+        """
+        Create from dictionary representation.
+        
+        Args:
+            data: Dictionary representation
+            
+        Returns:
+            Created visual scene
+        """
+        scene = VisualScene(scene_id=data.get("scene_id"))
+        
+        # Set basic properties
+        scene.global_attributes = data.get("global_attributes", {})
+        scene.width = data.get("width", 0)
+        scene.height = data.get("height", 0)
+        scene.source_image = data.get("source_image")
+        
+        # Try to parse creation time
+        if "creation_time" in data:
+            try:
+                scene.creation_time = datetime.fromisoformat(data["creation_time"])
+            except Exception:
+                scene.creation_time = datetime.now()
+                
+        # Create objects
+        for obj_data in data.get("objects", []):
+            obj = VisualObject(
+                label=obj_data.get("label", "unknown"),
+                confidence=obj_data.get("confidence", 1.0),
+                bbox=obj_data.get("bbox"),
+                attributes=obj_data.get("attributes")
+            )
+            
+            # Set object ID if available
+            if "object_id" in obj_data:
+                obj.object_id = obj_data["object_id"]
+                
+            # Set relationships
+            obj.relationships = obj_data.get("relationships", [])
+            
+            # Add to scene
+            scene.add_object(obj)
+            
+        return scene
+
+
+class ObjectRecognitionModule:
+    """
+    Module for recognizing objects in images using modern computer vision techniques.
+    """
+    
+    # COCO dataset class names for the Faster R-CNN model
+    COCO_CLASSES = [
+        'background', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+        'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 
+        'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 
+        'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 
+        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 
+        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 
+        'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 
+        'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant', 
+        'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 
+        'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 
+        'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+    ]
+    
+    def __init__(self, model_path: Optional[str] = None):
+        """
+        Initialize the object recognition module.
+        
+        Args:
+            model_path: Optional path to a custom recognition model
+        """
+        self.model_path = model_path
+        self.initialized = False
+        self.model = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if HAS_TORCH else None
+        self.color_analyzer = ColorAnalyzer()
+        
+        # Initialize model if PyTorch is available
+        if HAS_TORCH:
+            self.load_model()
+            
+    def load_model(self) -> bool:
+        """
+        Load the recognition model.
+        
+        Returns:
+            Success indicator
+        """
+        if not HAS_TORCH:
+            logger.warning("PyTorch not available. Object detection will use fallback implementation.")
+            self.initialized = False
+            return False
+            
+        try:
+            if self.model_path:
+                # Load custom model if path provided
+                self.model = torch.load(self.model_path, map_location=self.device)
+            else:
+                # Use pre-trained Faster R-CNN model
+                weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+                self.model = fasterrcnn_resnet50_fpn(weights=weights, box_score_thresh=0.5)
+                
+            self.model.to(self.device)
+            self.model.eval()
+            self.initialized = True
+            logger.info(f"Object recognition model loaded successfully on {self.device}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load object recognition model: {str(e)}")
+            self.initialized = False
+            return False
+    
+    def _prepare_image(self, image_input: Union[str, Image.Image, np.ndarray]) -> Optional[Image.Image]:
+        """
+        Prepare and normalize image for processing.
+        
+        Args:
+            image_input: Input image (path, PIL Image, or numpy array)
+            
+        Returns:
+            Prepared PIL image or None if preparation fails
+        """
+        try:
+            if isinstance(image_input, str):
+                # Handle URLs and local file paths
+                if image_input.startswith(('http://', 'https://')):
+                    response = requests.get(image_input, stream=True)
+                    response.raise_for_status()
+                    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+                elif os.path.exists(image_input):
+                    image = Image.open(image_input).convert("RGB")
+                else:
+                    raise ValueError(f"Image path not found: {image_input}")
+            elif isinstance(image_input, Image.Image):
+                image = image_input.convert("RGB")
+            elif isinstance(image_input, np.ndarray):
+                image = Image.fromarray(np.uint8(image_input)).convert("RGB")
+            else:
+                raise ValueError("Unsupported image type")
+                
+            return image
+        except Exception as e:
+            logger.error(f"Image preparation failed: {str(e)}")
+            return None
+            
+    def detect_objects(self, image: Union[str, Image.Image, np.ndarray]) -> List[VisualObject]:
+        """
+        Detect objects in an image using a deep learning model.
+        
+        Args:
+            image: Input image (path, PIL Image, or numpy array)
+            
+        Returns:
+            List of detected objects
+        """
+        # Prepare image
+        img = self._prepare_image(image)
+        if img is None:
+            return []
+            
+        # Get image dimensions
+        width, height = img.size
+        
+        # Use PyTorch model if available
+        if self.initialized and HAS_TORCH:
+            try:
+                # Convert image to tensor
+                img_tensor = F.to_tensor(img).unsqueeze(0).to(self.device)
+                
+                # Perform inference
+                with torch.no_grad():
+                    predictions = self.model(img_tensor)
+                    
+                # Process results
+                detected_objects = []
+                
+                for idx in range(len(predictions[0]['boxes'])):
+                    score = predictions[0]['scores'][idx].item()
+                    if score > 0.5:  # Confidence threshold
+                        box = predictions[0]['boxes'][idx].cpu().numpy()
+                        label_idx = predictions[0]['labels'][idx].item()
+                        
+                        # Get class label
+                        if 0 <= label_idx < len(self.COCO_CLASSES):
+                            label = self.COCO_CLASSES[label_idx]
+                        else:
+                            label = f"object_{label_idx}"
+                        
+                        # Normalize box coordinates
+                        x1, y1, x2, y2 = box
+                        norm_box = [
+                            x1 / width,
+                            y1 / height,
+                            x2 / width,
+                            y2 / height
+                        ]
+                        
+                        # Extract object crop for attribute analysis
+                        crop = img.crop((x1, y1, x2, y2))
+                        
+                        # Analyze attributes (like color)
+                        attributes = {}
+                        if label in ["car", "shirt", "book", "bicycle", "chair", "couch", "cup", "vase"]:
+                            # These objects typically have distinctive colors
+                            dominant_color, color_name = self.color_analyzer.analyze(crop)
+                            attributes["color"] = color_name
+                            attributes["color_rgb"] = dominant_color
+                            
+                        # Estimate size relative to image
+                        area_ratio = ((x2 - x1) * (y2 - y1)) / (width * height)
+                        if area_ratio < 0.05:
+                            attributes["size"] = "small"
+                        elif area_ratio < 0.15:
+                            attributes["size"] = "medium"
+                        else:
+                            attributes["size"] = "large"
+                            
+                        # Create the visual object
+                        obj = VisualObject(
+                            label=label,
+                            confidence=score,
+                            bbox=norm_box,
+                            attributes=attributes
+                        )
+                        
+                        detected_objects.append(obj)
+                        
+                return detected_objects
+                
+            except Exception as e:
+                logger.error(f"Object detection failed: {str(e)}")
+                # Fall back to OpenCV-based detection if PyTorch fails
+                return self._detect_with_opencv(img)
+        else:
+            # Use OpenCV-based detection as fallback
+            return self._detect_with_opencv(img)
+    
+    def _detect_with_opencv(self, img: Image.Image) -> List[VisualObject]:
+        """
+        Fallback object detection using OpenCV.
+        
+        Args:
+            img: PIL Image
+            
+        Returns:
+            List of detected objects
+        """
+        detected_objects = []
+        
+        try:
+            # Convert PIL Image to OpenCV format
+            cv_img = np.array(img)
+            cv_img = cv_img[:, :, ::-1].copy()  # RGB to BGR
+            
+            width, height = img.size
+            
+            # Use OpenCV's DNN module with a pre-trained model
+            try:
+                # Use YOLO or SSD if available
+                config_file = os.environ.get("OPENCV_DNN_CONFIG", "")
+                weights_file = os.environ.get("OPENCV_DNN_WEIGHTS", "")
+                
+                if os.path.exists(config_file) and os.path.exists(weights_file):
+                    net = cv2.dnn.readNetFromDarknet(config_file, weights_file)
+                    layer_names = net.getLayerNames()
+                    output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+                    
+                    # Prepare image for YOLO
+                    blob = cv2.dnn.blobFromImage(cv_img, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+                    net.setInput(blob)
+                    outs = net.forward(output_layers)
+                    
+                    class_ids = []
+                    confidences = []
+                    boxes = []
+                    
+                    for out in outs:
+                        for detection in out:
+                            scores = detection[5:]
+                            class_id = np.argmax(scores)
+                            confidence = scores[class_id]
+                            if confidence > 0.5:
+                                # Object detected
+                                center_x = int(detection[0] * width)
+                                center_y = int(detection[1] * height)
+                                w = int(detection[2] * width)
+                                h = int(detection[3] * height)
+                                
+                                # Rectangle coordinates
+                                x = int(center_x - w / 2)
+                                y = int(center_y - h / 2)
+                                
+                                boxes.append([x, y, w, h])
+                                confidences.append(float(confidence))
+                                class_ids.append(class_id)
+                    
+                    # Apply non-maximum suppression
+                    indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+                    
+                    for i in range(len(boxes)):
+                        if i in indexes:
+                            x, y, w, h = boxes[i]
+                            label = self.COCO_CLASSES[class_ids[i]] if class_ids[i] < len(self.COCO_CLASSES) else f"object_{class_ids[i]}"
+                            confidence = confidences[i]
+                            
+                            # Normalize coordinates
+                            norm_box = [
+                                max(0, x) / width,
+                                max(0, y) / height,
+                                min(width, x + w) / width,
+                                min(height, y + h) / height
+                            ]
+                            
+                            # Extract object crop for attribute analysis
+                            crop = img.crop((max(0, x), max(0, y), min(width, x + w), min(height, y + h)))
+                            
+                            # Analyze attributes
+                            attributes = {"size": "medium"}  # Default
+                            
+                            # Analyze color for certain objects
+                            if label in ["car", "shirt", "book", "bicycle", "chair", "couch"]:
+                                dominant_color, color_name = self.color_analyzer.analyze(crop)
+                                attributes["color"] = color_name
+                                
+                            # Create visual object
+                            obj = VisualObject(
+                                label=label,
+                                confidence=confidence,
+                                bbox=norm_box,
+                                attributes=attributes
+                            )
+                            
+                            detected_objects.append(obj)
+                else:
+                    # Fall back to simple CV-based detection if YOLO not available
+                    detected_objects = self._basic_cv_detection(cv_img, img)
+            except Exception as e:
+                logger.error(f"OpenCV DNN detection failed: {str(e)}")
+                detected_objects = self._basic_cv_detection(cv_img, img)
+                
+            return detected_objects
+                
+        except Exception as e:
+            logger.error(f"Fallback detection failed: {str(e)}")
+            return []
+    
+    def _basic_cv_detection(self, cv_img, pil_img):
+        """
+        Basic detection using OpenCV traditional methods.
+        """
+        detected_objects = []
+        width, height = pil_img.size
+        
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+            
+            # Try to detect faces as a simple fallback
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            
+            for (x, y, w, h) in faces:
+                # Normalize coordinates
+                norm_box = [
+                    max(0, x) / width,
+                    max(0, y) / height,
+                    min(width, x + w) / width,
+                    min(height, y + h) / height
+                ]
+                
+                # Create visual object
+                obj = VisualObject(
+                    label="person",
+                    confidence=0.8,
+                    bbox=norm_box,
+                    attributes={"size": "medium"}
+                )
+                
+                detected_objects.append(obj)
+                
+            # Simple contour-based detection for other objects
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, threshold = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                
+                # Filter small contours
+                if area > 1000:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Filter out potential duplicates with faces
+                    is_duplicate = False
+                    for obj in detected_objects:
+                        obj_x1, obj_y1, obj_x2, obj_y2 = [int(coord * (width if i % 2 == 0 else height)) 
+                                                        for i, coord in enumerate(obj.bbox)]
+                        overlap = max(0, min(x+w, obj_x2) - max(x, obj_x1)) * max(0, min(y+h, obj_y2) - max(y, obj_y1))
+                        if overlap / (w * h) > 0.5:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        # Normalize coordinates
+                        norm_box = [
+                            max(0, x) / width,
+                            max(0, y) / height,
+                            min(width, x + w) / width,
+                            min(height, y + h) / height
+                        ]
+                        
+                        # Extract object crop for attribute analysis
+                        crop = pil_img.crop((max(0, x), max(0, y), min(width, x + w), min(height, y + h)))
+                        
+                        # Analyze color
+                        dominant_color, color_name = self.color_analyzer.analyze(crop)
+                        
+                        # Determine label based on shape analysis
+                        approx = cv2.approxPolyDP(contour, 0.04 * cv2.arcLength(contour, True), True)
+                        
+                        if len(approx) == 4:
+                            label = "book"  # Or could be box/table
+                        elif len(approx) > 8:
+                            label = "ball"
+                        else:
+                            # Default based on position
+                            if y < height/3:
+                                label = "lamp"
+                            elif w > width/2:
+                                label = "table"
+                            else:
+                                label = "object"
+                                
+                        # Create visual object
+                        obj = VisualObject(
+                            label=label,
+                            confidence=0.6,
+                            bbox=norm_box,
+                            attributes={"color": color_name, "size": "medium"}
+                        )
+                        
+                        detected_objects.append(obj)
+                        
+        except Exception as e:
+            logger.error(f"Basic CV detection failed: {str(e)}")
+            
+        # If we still have no objects, add at least one generic object
+        if not detected_objects:
+            obj = VisualObject(
+                label="object",
+                confidence=0.5,
+                bbox=[0.3, 0.3, 0.7, 0.7],
+                attributes={"size": "medium"}
+            )
+            detected_objects.append(obj)
+            
+        return detected_objects
+        
+    def visualize_detections(self, image: Union[str, Image.Image], 
+                           objects: List[VisualObject]) -> Image.Image:
+        """
+        Visualize detected objects on an image.
+        
+        Args:
+            image: Input image (path or PIL Image)
+            objects: Detected objects
+            
+        Returns:
+            Annotated image
+        """
+        # Prepare image
+        img = self._prepare_image(image)
+        if img is None:
+            # Return blank image on error
+            return Image.new("RGB", (400, 300), color=(240, 240, 240))
+            
+        # Create drawing context
+        draw = ImageDraw.Draw(img)
+        width, height = img.size
+        
+        # Try to load a font
+        try:
+            font_path = os.path.join(os.path.dirname(__file__), "fonts", "arial.ttf")
+            if os.path.exists(font_path):
+                font = ImageFont.truetype(font_path, 14)
+            else:
+                # Try system fonts
+                system_fonts = [
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux
+                    "/Library/Fonts/Arial.ttf",  # macOS
+                    "C:\\Windows\\Fonts\\arial.ttf"  # Windows
+                ]
+                for sys_font in system_fonts:
+                    if os.path.exists(sys_font):
+                        font = ImageFont.truetype(sys_font, 14)
+                        break
+                else:
+                    font = ImageFont.load_default()
+        except Exception as e:
+            logger.warning(f"Failed to load font: {str(e)}")
+            font = ImageFont.load_default()
+            
+        # Draw each detection
+        for obj in objects:
+            # Get normalized coordinates
+            x1, y1, x2, y2 = obj.bbox
+            
+            # Convert to image coordinates
+            x1 = int(x1 * width)
+            y1 = int(y1 * height)
+            x2 = int(x2 * width)
+            y2 = int(y2 * height)
+            
+            # Choose color based on confidence
+            if obj.confidence > 0.8:
+                color = (0, 255, 0)  # Green for high confidence
+            elif obj.confidence > 0.5:
+                color = (255, 255, 0)  # Yellow for medium confidence
+            else:
+                color = (255, 0, 0)  # Red for low confidence
+                
+            # Draw bounding box
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+            
+            # Prepare label text
+            color_text = f" ({obj.attributes.get('color', '')})" if 'color' in obj.attributes else ""
+            label_text = f"{obj.label}{color_text} ({obj.confidence:.2f})"
+            
+            # Measure text for background
+            try:
+                # Different versions of PIL have different APIs
+                if hasattr(draw, "textbbox"):
+                    text_bbox = draw.textbbox((0, 0), label_text, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+                else:
+                    text_width, text_height = draw.textsize(label_text, font=font)
+            except Exception:
+                # Fallback to estimated size
+                text_width, text_height = len(label_text) * 7, 15
+            
+            # Draw background for text
+            draw.rectangle(
+                [x1, y1 - text_height - 4, x1 + text_width + 4, y1],
+                fill=color
+            )
+            
+            # Draw text
+            draw.text((x1 + 2, y1 - text_height - 2), label_text, fill=(0, 0, 0), font=font)
+            
+        return img
+
+
+class ColorAnalyzer:
+    """
+    Module for analyzing colors in images.
+    """
+    
+    def __init__(self):
+        """Initialize the color analyzer."""
+        # Define color name mapping
+        self.color_map = {
+            # Red shades
+            (255, 0, 0): "red",
+            (180, 0, 0): "dark red",
+            (255, 102, 102): "light red",
+            (128, 0, 0): "maroon",
+            # Green shades
+            (0, 255, 0): "green",
+            (0, 180, 0): "dark green",
+            (102, 255, 102): "light green",
+            (34, 139, 34): "forest green",
+            # Blue shades
+            (0, 0, 255): "blue",
+            (0, 0, 180): "dark blue",
+            (102, 102, 255): "light blue",
+            (0, 0, 128): "navy",
+            # Yellow shades
+            (255, 255, 0): "yellow",
+            (255, 215, 0): "gold",
+            (255, 255, 102): "light yellow",
+            # Purple shades
+            (128, 0, 128): "purple",
+            (186, 85, 211): "medium orchid",
+            (153, 50, 204): "dark orchid",
+            # Orange shades
+            (255, 165, 0): "orange",
+            (255, 127, 80): "coral",
+            (255, 69, 0): "red-orange",
+            # Brown shades
+            (165, 42, 42): "brown",
+            (210, 105, 30): "chocolate",
+            (139, 69, 19): "saddle brown",
+            # White and black
+            (255, 255, 255): "white",
+            (0, 0, 0): "black",
+            # Gray shades
+            (128, 128, 128): "gray",
+            (169, 169, 169): "dark gray",
+            (211, 211, 211): "light gray",
+            # Pink shades
+            (255, 192, 203): "pink",
+            (255, 105, 180): "hot pink",
+            (219, 112, 147): "pale violet red",
+            # Cyan shades
+            (0, 255, 255): "cyan",
+            (224, 255, 255): "light cyan",
+            (0, 206, 209): "dark turquoise",
+        }
+    
+    def analyze(self, image: Image.Image) -> Tuple[Tuple[int, int, int], str]:
+        """
+        Analyze the dominant color in an image.
+        
+        Args:
+            image: PIL Image
+            
+        Returns:
+            Tuple containing (RGB tuple, color name)
+        """
+        try:
+            # Resize image for faster processing
+            img = image.copy()
+            img.thumbnail((100, 100))
+            
+            # Convert to RGB if not already
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            # Get colors
+            colors = img.getcolors(maxcolors=10000)
+            if not colors:
+                return (128, 128, 128), "gray"
+                
+            # Find most common color
+            dominant_color = max(colors, key=lambda x: x[0])[1]
+            
+            # Find closest color name
+            color_name = self._get_closest_color_name(dominant_color)
+            
+            return dominant_color, color_name
+        except Exception as e:
+            logger.error(f"Color analysis failed: {str(e)}")
+            return (128, 128, 128), "gray"
+    
+    def _get_closest_color_name(self, rgb: Tuple[int, int, int]) -> str:
+        """
+        Get the closest named color to an RGB value.
+        
+        Args:
+            rgb: RGB color tuple
+            
+        Returns:
+            Color name
+        """
+        min_distance = float('inf')
+        closest_name = "unknown"
+        
+        for color_rgb, name in self.color_map.items():
+            distance = self._color_distance(rgb, color_rgb)
+            if distance < min_distance:
+                min_distance = distance
+                closest_name = name
+                
+        return closest_name
+    
+    def _color_distance(self, rgb1: Tuple[int, int, int], rgb2: Tuple[int, int, int]) -> float:
+        """
+        Calculate distance between two RGB colors.
+        
+        Args:
+            rgb1: First RGB color
+            rgb2: Second RGB color
+            
+        Returns:
+            Color distance
+        """
+        r1, g1, b1 = rgb1
+        r2, g2, b2 = rgb2
+        
+        # Weighted Euclidean distance (human eye is more sensitive to green)
+        return ((r2-r1)*0.30)**2 + ((g2-g1)*0.59)**2 + ((b2-b1)*0.11)**2
+
+
+class SceneClassifier:
+    """
+    Module for classifying scene types using deep learning.
+    """
+    
+    def __init__(self):
+        """Initialize the scene classifier."""
+        self.model = None
+        self.processor = None
+        self.initialized = False
+        self.scene_categories = [
+            "bathroom", "bedroom", "conference_room", "dining_room", "highway",
+            "kitchen", "living_room", "mountain", "office", "street", "forest",
+            "coast", "field", "store", "urban"
+        ]
+        
+        # Initialize if transformers available
+        if HAS_TRANSFORMERS:
+            self.load_model()
+    
+    def load_model(self) -> bool:
+        """
+        Load scene classification model.
+        
+        Returns:
+            Success indicator
+        """
+        if not HAS_TRANSFORMERS:
+            logger.warning("Transformers library not available. Scene classification will use fallback.")
+            return False
+            
+        try:
+            # Load a pre-trained scene classification model
+            # Most scene classification models use ResNet or ViT architecture
+            self.processor = AutoFeatureExtractor.from_pretrained("microsoft/resnet-50")
+            self.model = AutoModelForImageClassification.from_pretrained("microsoft/resnet-50")
+            
+            self.initialized = True
+            logger.info("Scene classification model loaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load scene classification model: {str(e)}")
+            self.initialized = False
+            return False
+    
+    def classify(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        Classify the scene type in an image.
+        
+        Args:
+            image: PIL Image
+            
+        Returns:
+            Dictionary with classification results
+        """
+        # Use transformers model if available
+        if self.initialized and HAS_TRANSFORMERS:
+            try:
+                # Process image
+                inputs = self.processor(images=image, return_tensors="pt")
+                
+                # Get predictions
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits
+                    predicted_class_idx = logits.argmax(-1).item()
+                
+                # Map to category name
+                categories = self.model.config.id2label
+                category = categories[predicted_class_idx]
+                confidence = torch.softmax(logits, dim=-1)[0, predicted_class_idx].item()
+                
+                return {
+                    "scene_type": category,
+                    "confidence": confidence,
+                    "method": "deep_learning"
+                }
+            except Exception as e:
+                logger.error(f"Scene classification failed: {str(e)}")
+                return self._fallback_classify(image)
+        else:
+            # Use fallback method
+            return self._fallback_classify(image)
+    
+    def _fallback_classify(self, image: Image.Image) -> Dict[str, Any]:
+        """
+        Fallback scene classification using color and texture analysis.
+        
+        Args:
+            image: PIL Image
+            
+        Returns:
+            Classification results
+        """
+        try:
+            # Resize for faster processing
+            img = image.copy()
+            img.thumbnail((200, 200))
+            
+            # Convert to RGB
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+                
+            # Convert to numpy array
+            img_array = np.array(img)
+            
+            # Simple color analysis
+            avg_color = np.mean(img_array, axis=(0, 1))
+            
+            # Extract HSV for better color analysis
+            hsv_img = None
+            try:
+                # Convert to HSV using OpenCV if available
+                if 'cv2' in globals():
+                    bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                    hsv_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+            except Exception:
+                hsv_img = None
+                
+            # Extract basic features
+            brightness = np.mean(img_array)
+            saturation = np.std(img_array)
+            
+            # Texture analysis (simple entropy)
+            try:
+                gray = np.mean(img_array, axis=2).astype(np.uint8)
+                texture_entropy = np.std(gray)
+            except Exception:
+                texture_entropy = 0
+                
+            # Color histogram
+            try:
+                hist_r = np.histogram(img_array[:,:,0], bins=8, range=(0, 256))[0]
+                hist_g = np.histogram(img_array[:,:,1], bins=8, range=(0, 256))[0]
+                hist_b = np.histogram(img_array[:,:,2], bins=8, range=(0, 256))[0]
+                
+                # Normalize histograms
+                hist_r = hist_r / np.sum(hist_r)
+                hist_g = hist_g / np.sum(hist_g)
+                hist_b = hist_b / np.sum(hist_b)
+                
+                # Combine histograms
+                hist = np.concatenate([hist_r, hist_g, hist_b])
+            except Exception:
+                hist = np.ones(24) / 24
+                
+            # Simple rule-based classification
+            # High blue often indicates outdoor scenes
+            blue_ratio = avg_color[2] / (avg_color[0] + avg_color[1] + 1)
+            
+            # High green often indicates nature scenes
+            green_ratio = avg_color[1] / (avg_color[0] + avg_color[2] + 1)
+            
+            # Determine scene type based on features
+            if blue_ratio > 1.2 and brightness > 150:
+                scene_type = "coast" if green_ratio < 0.8 else "mountain"
+                confidence = 0.6
+            elif green_ratio > 1.2:
+                scene_type = "forest"
+                confidence = 0.7
+            elif brightness < 80:
+                scene_type = "indoor" if texture_entropy > 40 else "urban"
+                confidence = 0.5
+            elif brightness > 200:
+                scene_type = "snow" if np.std(img_array) < 40 else "beach"
+                confidence = 0.6
+            elif texture_entropy > 50:
+                scene_type = "urban"
+                confidence = 0.5
+            else:
+                scene_type = "indoor"
+                confidence = 0.4
+                
+            return {
+                "scene_type": scene_type,
+                "confidence": confidence,
+                "method": "color_analysis",
+                "features": {
+                    "brightness": float(brightness),
+                    "texture": float(texture_entropy),
+                    "blue_ratio": float(blue_ratio),
+                    "green_ratio": float(green_ratio)
+                }
+            }
+                
+        except Exception as e:
+            logger.error(f"Fallback scene classification failed: {str(e)}")
+            return {
+                "scene_type": "unknown",
+                "confidence": 0.3,
+                "method": "default"
+            }
+
+
+class SceneUnderstandingModule:
+    """
+    Module for understanding relationships and context in visual scenes.
+    """
+    
+    def __init__(self):
+        """Initialize the scene understanding module."""
+        self.spatial_relationships = [
+            "above", "below", "left_of", "right_of", "inside", "contains",
+            "touching", "near", "far_from", "in_front_of", "behind",
+            "centered", "aligned_with"
+        ]
+        self.scene_classifier = SceneClassifier()
+        
+    def analyze_scene(self, objects: List[VisualObject], 
+                     image_width: int, image_height: int,
+                     image: Optional[Image.Image] = None) -> VisualScene:
+        """
+        Analyze a scene with detected objects to understand relationships.
+        
+        Args:
+            objects: Detected objects
+            image_width: Image width
+            image_height: Image height
+            image: Optional original image for scene classification
+            
+        Returns:
+            Analyzed visual scene
+        """
+        # Create a new scene
+        scene = VisualScene()
+        scene.set_dimensions(image_width, image_height)
+        
+        # Add objects to scene
+        for obj in objects:
+            scene.add_object(obj)
+            
+        # Analyze spatial relationships
+        for i, obj1 in enumerate(objects):
+            for j, obj2 in enumerate(objects):
+                if i != j:
+                    # Identify relationships
+                    relationships = self._identify_spatial_relationships(obj1, obj2)
+                    
+                    # Add relationships to object
+                    for rel_type, confidence in relationships:
+                        obj1.add_relationship(rel_type, obj2, confidence)
+                        
+        # Add global scene attributes
+        scene.global_attributes["object_count"] = len(objects)
+        scene.global_attributes["primary_objects"] = self._identify_primary_objects(objects)
+        
+        # Classify scene type
+        if image is not None:
+            # Use scene classifier if image is available
+            classification = self.scene_classifier.classify(image)
+            scene.global_attributes["scene_type"] = classification["scene_type"]
+            scene.global_attributes["scene_confidence"] = classification["confidence"]
+            scene.global_attributes["classification_method"] = classification["method"]
+        else:
+            # Fall back to object-based classification
+            scene.global_attributes["scene_type"] = self._classify_scene_type(objects)
+            scene.global_attributes["classification_method"] = "object_based"
+            
+        # Add additional scene metadata
+        scene.global_attributes["analysis_time"] = datetime.now().isoformat()
+        scene.global_attributes["object_density"] = len(objects) / (image_width * image_height / 1000000)  # Objects per million pixels
+        
+        # Detect potential activities
+        scene.global_attributes["activities"] = self._detect_activities(objects)
+        
+        return scene
+        
+    def _identify_spatial_relationships(self, obj1: VisualObject, 
+                                      obj2: VisualObject) -> List[Tuple[str, float]]:
+        """
+        Identify spatial relationships between two objects.
+        
+        Args:
+            obj1: First object
+            obj2: Second object
+            
+        Returns:
+            List of (relationship_type, confidence) tuples
+        """
+        relationships = []
+        
+        # Get bounding box coordinates
+        x1_1, y1_1, x2_1, y2_1 = obj1.bbox
+        x1_2, y1_2, x2_2, y2_2 = obj2.bbox
+        
+        # Calculate centers
+        center_x1 = (x1_1 + x2_1) / 2
+        center_y1 = (y1_1 + y2_1) / 2
+        center_x2 = (x1_2 + x2_2) / 2
+        center_y2 = (y1_2 + y2_2) / 2
+        
+        # Calculate areas
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        
+        # Check "above" relationship
+        if y2_1 < y1_2:
+            confidence = min(1.0, (y1_2 - y2_1) * 5)  # Higher confidence for larger vertical separation
+            relationships.append(("above", confidence))
+            
+        # Check "below" relationship
+        if y1_1 > y2_2:
+            confidence = min(1.0, (y1_1 - y2_2) * 5)
+            relationships.append(("below", confidence))
+            
+        # Check "left_of" relationship
+        if x2_1 < x1_2:
+            confidence = min(1.0, (x1_2 - x2_1) * 5)
+            relationships.append(("left_of", confidence))
+            
+        # Check "right_of" relationship
+        if x1_1 > x2_2:
+            confidence = min(1.0, (x1_1 - x2_2) * 5)
+            relationships.append(("right_of", confidence))
+            
+        # Check "contains" relationship
+        if x1_1 <= x1_2 and y1_1 <= y1_2 and x2_1 >= x2_2 and y2_1 >= y2_2:
+            # Calculate containment ratio (area of obj2 / area of obj1)
+            if area1 > 0:
+                containment_ratio = area2 / area1
+                # Higher confidence for smaller contained objects
+                confidence = min(1.0, max(0.5, 1.0 - containment_ratio))
+                relationships.append(("contains", confidence))
+                
+        # Check "inside" relationship
+        if x1_2 <= x1_1 and y1_2 <= y1_1 and x2_2 >= x2_1 and y2_2 >= y2_1:
+            # Calculate containment ratio (area of obj1 / area of obj2)
+            if area2 > 0:
+                containment_ratio = area1 / area2
+                # Higher confidence for smaller contained objects
+                confidence = min(1.0, max(0.5, 1.0 - containment_ratio))
+                relationships.append(("inside", confidence))
+                
+        # Check "near" relationship
+        distance = ((center_x1 - center_x2) ** 2 + (center_y1 - center_y2) ** 2) ** 0.5
+        if distance < 0.2:  # Threshold for "near"
+            confidence = min(1.0, max(0.5, 1.0 - distance * 5))
+            relationships.append(("near", confidence))
+            
+        # Check "touching" relationship
+        # Simple approximation: consider objects touching if their bounding boxes are very close
+        horizontal_overlap = (x1_1 <= x2_2 and x2_1 >= x1_2)
+        vertical_overlap = (y1_1 <= y2_2 and y2_1 >= y1_2)
+        
+        if horizontal_overlap and vertical_overlap:
+            # Calculate overlap area
+            overlap_width = min(x2_1, x2_2) - max(x1_1, x1_2)
+            overlap_height = min(y2_1, y2_2) - max(y1_1, y1_2)
+            overlap_area = overlap_width * overlap_height
+            
+            # If overlap area is small, they might be touching
+            if 0 < overlap_area < 0.05 * min(area1, area2):
+                relationships.append(("touching", 0.7))
+                
+        # Check "aligned_with" relationship (horizontally or vertically)
+        horizontal_aligned = abs(center_y1 - center_y2) < 0.05
+        vertical_aligned = abs(center_x1 - center_x2) < 0.05
+        
+        if horizontal_aligned and not vertical_aligned:
+            relationships.append(("horizontally_aligned_with", 0.8))
+        elif vertical_aligned and not horizontal_aligned:
+            relationships.append(("vertically_aligned_with", 0.8))
+        elif horizontal_aligned and vertical_aligned:
+            relationships.append(("centered_with", 0.9))
+                
+        return relationships
+        
+    def _identify_primary_objects(self, objects: List[VisualObject]) -> List[str]:
+        """
+        Identify primary objects in the scene.
+        
+        Args:
+            objects: Detected objects
+            
+        Returns:
+            List of primary object labels
+        """
+        if not objects:
+            return []
+            
+        # Calculate importance score based on multiple factors
+        object_importance = []
+        
+        for obj in objects:
+            # Calculate area
+            x1, y1, x2, y2 = obj.bbox
+            area = (x2 - x1) * (y2 - y1)
+            
+            # Calculate centrality
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            centrality = 1 - (((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2) ** 0.5)
+            
+            # Consider confidence
+            confidence = obj.confidence
+            
+            # Define intrinsic importance for certain object types
+            intrinsic_importance = 1.0
+            
+            if obj.label == "person":
+                intrinsic_importance = 1.5
+            elif obj.label in ["car", "bicycle", "motorcycle", "truck", "bus", "train", "airplane"]:
+                intrinsic_importance = 1.3
+            elif obj.label in ["cat", "dog", "horse", "elephant", "bear", "giraffe", "zebra"]:
+                intrinsic_importance = 1.2
+                
+            # Calculate overall importance
+            importance = (area * 3 + centrality * 2 + confidence * 1.5) * intrinsic_importance
+            
+            object_importance.append((obj, importance))
+            
+        # Sort by importance score
+        object_importance.sort(key=lambda x: x[1], reverse=True)
+        
+        # Return top 3 (or fewer if not enough objects)
+        return [obj.label for obj, _ in object_importance[:min(3, len(object_importance))]]
+        
+    def _classify_scene_type(self, objects: List[VisualObject]) -> str:
+        """
+        Classify the type of scene based on objects.
+        
+        Args:
+            objects: Detected objects
+            
+        Returns:
+            Scene type classification
+        """
+        # Simple rule-based classification
+        if not objects:
+            return "unknown"
+            
+        # Count object types and group by categories
+        object_types = {}
+        category_counts = {
+            "people": 0,
+            "vehicles": 0,
+            "furniture": 0,
+            "nature": 0,
+            "animals": 0,
+            "food": 0,
+            "electronics": 0,
+            "kitchenware": 0,
+            "sports": 0
+        }
+        
+        # Define category mappings
+        category_mappings = {
+            "people": ["person"],
+            "vehicles": ["car", "truck", "bus", "motorcycle", "bicycle", "train", "airplane", "boat"],
+            "furniture": ["chair", "couch", "bed", "table", "desk", "bench", "bookshelf", "cabinet"],
+            "nature": ["tree", "plant", "flower", "grass", "mountain", "rock", "water"],
+            "animals": ["cat", "dog", "bird", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe"],
+            "food": ["banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake"],
+            "electronics": ["tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven"],
+            "kitchenware": ["bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "plate"],
+            "sports": ["frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket"]
+        }
+        
+        # Count objects by type and category
+        for obj in objects:
+            # Count by specific type
+            if obj.label not in object_types:
+                object_types[obj.label] = 0
+            object_types[obj.label] += 1
+            
+            # Count by category
+            for category, labels in category_mappings.items():
+                if obj.label in labels:
+                    category_counts[category] += 1
+                    break
+                    
+        # Determine the dominant category
+        dominant_category = max(category_counts.items(), key=lambda x: x[1])
+        
+        # Apply classification rules
+        if dominant_category[0] == "people" and dominant_category[1] >= 2:
+            return "social"
+            
+        if dominant_category[0] == "vehicles" and dominant_category[1] >= 1:
+            if "road" in object_types or "highway" in object_types:
+                return "road"
+            else:
+                return "transportation"
+                
+        if dominant_category[0] == "furniture" and dominant_category[1] >= 1:
+            if category_counts["kitchenware"] >= 1:
+                return "kitchen"
+            elif "bed" in object_types:
+                return "bedroom"
+            elif "couch" in object_types or "tv" in object_types:
+                return "living_room"
+            elif "dining table" in object_types:
+                return "dining_room"
+            else:
+                return "indoor"
+                
+        if dominant_category[0] == "nature" and dominant_category[1] >= 1:
+            if "tree" in object_types and object_types["tree"] >= 3:
+                return "forest"
+            elif "water" in object_types:
+                return "coast"
+            else:
+                return "nature"
+                
+        if dominant_category[0] == "food" and dominant_category[1] >= 2:
+            return "food"
+            
+        if dominant_category[0] == "animals" and dominant_category[1] >= 1:
+            if category_counts["nature"] >= 1:
+                return "wildlife"
+            else:
+                return "animal"
+                
+        if dominant_category[0] == "electronics" and category_counts["furniture"] >= 1:
+            return "office"
+            
+        if dominant_category[0] == "sports" and dominant_category[1] >= 1:
+            return "sports"
+            
+        # Default fallback based on object count
+        if len(objects) == 0:
+            return "empty"
+        elif len(objects) <= 2:
+            return "minimal"
+        else:
+            return "general"
+    
+    def _detect_activities(self, objects: List[VisualObject]) -> List[Dict[str, Any]]:
+        """
+        Detect potential activities in the scene based on object combinations.
+        
+        Args:
+            objects: Detected objects
+            
+        Returns:
+            List of potential activities
+        """
+        activities = []
+        
+        # Get object labels
+        labels = [obj.label for obj in objects]
+        label_count = {}
+        for label in labels:
+            if label not in label_count:
+                label_count[label] = 0
+            label_count[label] += 1
+            
+        # Define activity patterns
+        activity_patterns = [
+            {
+                "name": "dining",
+                "confidence": 0.8,
+                "required": ["dining table"],
+                "optional": ["chair", "fork", "knife", "spoon", "bowl", "cup", "wine glass", "person"]
+            },
+            {
+                "name": "working",
+                "confidence": 0.7,
+                "required": ["laptop"],
+                "optional": ["person", "chair", "desk", "book", "cup"]
+            },
+            {
+                "name": "watching TV",
+                "confidence": 0.7,
+                "required": ["tv"],
+                "optional": ["person", "couch", "remote"]
+            },
+            {
+                "name": "cooking",
+                "confidence": 0.7,
+                "required": ["oven"],
+                "optional": ["person", "microwave", "refrigerator", "sink", "bowl", "knife"]
+            },
+            {
+                "name": "reading",
+                "confidence": 0.6,
+                "required": ["book"],
+                "optional": ["person", "chair", "couch"]
+            },
+            {
+                "name": "traveling",
+                "confidence": 0.7,
+                "required": ["car", "truck", "bus", "motorcycle", "train", "airplane"],  # Any one of these
+                "optional": ["person", "suitcase", "backpack"]
+            },
+            {
+                "name": "sports",
+                "confidence": 0.7,
+                "required": ["sports ball", "frisbee", "tennis racket", "baseball bat", "skateboard", "surfboard"],  # Any one of these
+                "optional": ["person"]
+            }
+        ]
+        
+        # Check for each activity pattern
+        for pattern in activity_patterns:
+            # For required items, check if any of them is present (OR logic)
+            required_present = False
+            for required_item in pattern["required"]:
+                if required_item in label_count:
+                    required_present = True
+                    break
+                    
+            if not required_present:
+                continue
+                
+            # Count optional items
+            optional_count = 0
+            for optional_item in pattern["optional"]:
+                if optional_item in label_count:
+                    optional_count += 1
+                    
+            # Calculate confidence based on optional items
+            optional_factor = min(1.0, optional_count / max(1, len(pattern["optional"])))
+            confidence = pattern["confidence"] * (0.7 + 0.3 * optional_factor)
+            
+            # Add to detected activities
+            activities.append({
+                "activity": pattern["name"],
+                "confidence": confidence
+            })
+            
+        return activities
+        
+    def describe_scene(self, scene: VisualScene) -> str:
+        """
+        Generate a comprehensive description of a scene.
+        
+        Args:
+            scene: The visual scene to describe
+            
+        Returns:
+            Scene description
+        """
+        # Start with basic scene information
+        scene_type = scene.global_attributes.get("scene_type", "general")
+        object_count = scene.global_attributes.get("object_count", len(scene.objects))
+        
+        description = f"This appears to be a {scene_type} scene containing {object_count} objects. "
+        
+        # Mention primary objects
+        primary_objects = scene.global_attributes.get("primary_objects", [])
+        if primary_objects:
+            description += f"The main elements are: {', '.join(primary_objects)}. "
+            
+        # Mention potential activities
+        activities = scene.global_attributes.get("activities", [])
+        if activities:
+            # Filter by confidence and sort
+            high_confidence_activities = [a for a in activities if a["confidence"] > 0.6]
+            if high_confidence_activities:
+                high_confidence_activities.sort(key=lambda x: x["confidence"], reverse=True)
+                activity_names = [a["activity"] for a in high_confidence_activities[:2]]
+                description += f"The scene suggests {' or '.join(activity_names)}. "
             
         # Describe spatial composition
         spatial_description = self._generate_spatial_description(scene)
@@ -771,542 +3253,14 @@ class SceneUnderstandingModule:
                     relations_text.append(f"the {obj1} is near the {obj2}")
                 elif rel_type == "touching":
                     relations_text.append(f"the {obj1} is touching the {obj2}")
+                elif rel_type == "horizontally_aligned_with":
+                    relations_text.append(f"the {obj1} is horizontally aligned with the {obj2}")
+                elif rel_type == "vertically_aligned_with":
+                    relations_text.append(f"the {obj1} is vertically aligned with the {obj2}")
+                elif rel_type == "centered_with":
+                    relations_text.append(f"the {obj1} is centered with the {obj2}")
                     
             if relations_text:
                 return "In terms of spatial arrangement, " + "; ".join(relations_text) + "."
                 
         return ""
-
-
-class VisualCognitionSystem:
-    """
-    Advanced system for processing, understanding, and reasoning about visual inputs.
-    Integrates object recognition, scene understanding, and conceptual mapping.
-    """
-
-    def __init__(self, reasoning_engine=None, codex=None):
-        """
-        Initialize the visual cognition system.
-        
-        Args:
-            reasoning_engine: Optional reasoning engine for high-level analysis
-            codex: Optional knowledge base for conceptual mapping
-        """
-        # Core components
-        self.object_recognition = ObjectRecognitionModule()
-        self.scene_understanding = SceneUnderstandingModule()
-        
-        # External connections
-        self.reasoning = reasoning_engine
-        self.codex = codex
-        
-        # State
-        self.processed_scenes = {}  # scene_id -> VisualScene
-        self.scene_history = []  # Recent scenes
-        self.visual_memory = {}  # Persistent visual concepts
-        
-    def process_image(self, image: Union[str, Image.Image, np.ndarray], 
-                     scene_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Process an image to extract objects, relationships, and meaning.
-        
-        Args:
-            image: The image to process
-            scene_id: Optional scene identifier
-            
-        Returns:
-            Processing results
-        """
-        try:
-            # Load image if path provided
-            if isinstance(image, str) and os.path.exists(image):
-                img = Image.open(image)
-                image_path = image
-            elif isinstance(image, Image.Image):
-                img = image
-                image_path = None
-            elif isinstance(image, np.ndarray):
-                img = Image.fromarray(image.astype('uint8'))
-                image_path = None
-            else:
-                return {"error": "Invalid image input"}
-                
-            # Get image dimensions
-            width, height = img.size
-            
-            # Detect objects
-            detected_objects = self.object_recognition.detect_objects(img)
-            
-            # Create scene
-            scene_id = scene_id or str(uuid.uuid4())
-            
-            # Analyze scene relationships
-            scene = self.scene_understanding.analyze_scene(
-                detected_objects,
-                width,
-                height
-            )
-            
-            # Set scene properties
-            scene.scene_id = scene_id
-            scene.set_source(image_path)
-            
-            # Generate visualized image
-            try:
-                visualized_img = self.object_recognition.visualize_detections(img, detected_objects)
-                # Could save visualized image if needed:
-                # visualized_img.save(f"visualized_{scene_id}.jpg")
-            except Exception:
-                visualized_img = None
-                
-            # Generate scene description
-            description = self.scene_understanding.describe_scene(scene)
-            
-            # Store in processed scenes
-            self.processed_scenes[scene_id] = scene
-            
-            # Add to history
-            self.scene_history.append({
-                "scene_id": scene_id,
-                "timestamp": datetime.now().isoformat(),
-                "object_count": len(detected_objects)
-            })
-            
-            # Limit history size
-            if len(self.scene_history) > 100:
-                self.scene_history = self.scene_history[-100:]
-                
-            # Prepare response
-            result = {
-                "success": True,
-                "scene_id": scene_id,
-                "width": width,
-                "height": height,
-                "object_count": len(detected_objects),
-                "objects": [obj.to_dict() for obj in detected_objects],
-                "scene_type": scene.global_attributes.get("scene_type", "unknown"),
-                "description": description
-            }
-            
-            return result
-            
-        except Exception as e:
-            return {
-                "error": f"Image processing failed: {str(e)}",
-                "success": False
-            }
-            
-    def get_scene(self, scene_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a processed scene by ID.
-        
-        Args:
-            scene_id: Scene identifier
-            
-        Returns:
-            Scene data or None if not found
-        """
-        if scene_id in self.processed_scenes:
-            scene = self.processed_scenes[scene_id]
-            return scene.to_dict()
-        return None
-        
-    def search_visual_memory(self, query: str) -> List[Dict[str, Any]]:
-        """
-        Search for visual concepts in memory.
-        
-        Args:
-            query: Search query
-            
-        Returns:
-            Matching results
-        """
-        results = []
-        
-        # Search in processed scenes
-        for scene_id, scene in self.processed_scenes.items():
-            match_score = 0
-            
-            # Check for object label matches
-            for obj in scene.objects.values():
-                if query.lower() in obj.label.lower():
-                    match_score += 1
-                    
-            # Check scene type match
-            if "scene_type" in scene.global_attributes:
-                if query.lower() in scene.global_attributes["scene_type"].lower():
-                    match_score += 2
-                    
-            if match_score > 0:
-                results.append({
-                    "scene_id": scene_id,
-                    "match_score": match_score,
-                    "scene_type": scene.global_attributes.get("scene_type", "unknown"),
-                    "object_count": len(scene.objects),
-                    "creation_time": scene.creation_time.isoformat()
-                })
-                
-        # Sort by match score
-        results.sort(key=lambda x: x["match_score"], reverse=True)
-        
-        return results
-        
-    def integrate_with_conceptual_knowledge(self, scene_id: str) -> Dict[str, Any]:
-        """
-        Connect visual scene with conceptual knowledge.
-        
-        Args:
-            scene_id: Scene identifier
-            
-        Returns:
-            Integration results
-        """
-        if scene_id not in self.processed_scenes:
-            return {"error": f"Scene {scene_id} not found"}
-            
-        scene = self.processed_scenes[scene_id]
-        
-        # Need codex for conceptual integration
-        if not self.codex:
-            return {
-                "error": "Codex required for conceptual integration",
-                "scene_id": scene_id
-            }
-            
-        try:
-            # Connect objects to concepts
-            object_concepts = {}
-            
-            for obj_id, obj in scene.objects.items():
-                # Search codex for object concept
-                concept_results = self.codex.search(obj.label)
-                
-                if concept_results:
-                    # Get top concept match
-                    top_concept = next(iter(concept_results))
-                    
-                    object_concepts[obj_id] = {
-                        "object_label": obj.label,
-                        "concept": top_concept,
-                        "concept_data": concept_results[top_concept]
-                    }
-                    
-            # If reasoning engine available, generate insights
-            insights = []
-            if self.reasoning and object_concepts:
-                # Get object labels
-                object_labels = [obj.label for obj in scene.objects.values()]
-                
-                # Generate insights prompt
-                prompt = f"""
-                Generate insights about the relationship between these visual elements:
-                {', '.join(object_labels)}
-                
-                Consider their symbolic meaning, potential conceptual relationships, and
-                possible interpretations based on their arrangement in a {scene.global_attributes.get('scene_type', 'general')} scene.
-                """
-                
-                # Get insights
-                insight_result = self.reasoning.reason(prompt, "creative")
-                
-                if isinstance(insight_result, dict) and "response" in insight_result:
-                    insights.append(insight_result["response"])
-                elif isinstance(insight_result, str):
-                    insights.append(insight_result)
-                    
-            return {
-                "success": True,
-                "scene_id": scene_id,
-                "object_concepts": object_concepts,
-                "insights": insights
-            }
-            
-        except Exception as e:
-            return {
-                "error": f"Conceptual integration failed: {str(e)}",
-                "scene_id": scene_id
-            }
-            
-    def generate_visual_prediction(self, scene_id: str, action: str) -> Dict[str, Any]:
-        """
-        Predict visual outcome of an action on a scene.
-        
-        Args:
-            scene_id: Scene identifier
-            action: Action to perform
-            
-        Returns:
-            Prediction results
-        """
-        if scene_id not in self.processed_scenes:
-            return {"error": f"Scene {scene_id} not found"}
-            
-        scene = self.processed_scenes[scene_id]
-        
-        # Need reasoning engine for predictions
-        if not self.reasoning:
-            return {
-                "error": "Reasoning engine required for visual predictions",
-                "scene_id": scene_id
-            }
-            
-        try:
-            # Generate prediction using reasoning engine
-            scene_desc = self.scene_understanding.describe_scene(scene)
-            
-            # Create prediction prompt
-            prompt = f"""
-            Visual Scene: {scene_desc}
-            
-            Predict what would happen visually if the following action occurred:
-            {action}
-            
-            Describe:
-            1. How the objects would change in appearance or position
-            2. Any new objects that might appear
-            3. Any objects that might disappear or be altered
-            4. The overall visual outcome
-            """
-            
-            # Get prediction
-            prediction_result = self.reasoning.reason(prompt, "analytical")
-            
-            if isinstance(prediction_result, dict) and "response" in prediction_result:
-                prediction = prediction_result["response"]
-            elif isinstance(prediction_result, str):
-                prediction = prediction_result
-            else:
-                prediction = "Unable to generate prediction."
-                
-            return {
-                "success": True,
-                "scene_id": scene_id,
-                "action": action,
-                "prediction": prediction
-            }
-            
-        except Exception as e:
-            return {
-                "error": f"Visual prediction failed: {str(e)}",
-                "scene_id": scene_id,
-                "action": action
-            }
-            
-    def create_mental_imagery(self, concept: str) -> Dict[str, Any]:
-        """
-        Generate a mental image description based on a concept.
-        
-        Args:
-            concept: Concept to visualize
-            
-        Returns:
-            Mental imagery description
-        """
-        # Need reasoning engine for mental imagery
-        if not self.reasoning:
-            return {"error": "Reasoning engine required for mental imagery"}
-            
-        try:
-            # Create mental imagery prompt
-            prompt = f"""
-            Generate a detailed visual description of the concept: {concept}
-            
-            Describe:
-            1. What objects would appear in this mental image
-            2. Their spatial arrangement and visual properties
-            3. The overall scene composition
-            4. Colors, lighting, and atmosphere
-            5. Any movement or action in the scene
-            
-            Make the description detailed enough that someone could visualize it clearly.
-            """
-            
-            # Get imagery description
-            imagery_result = self.reasoning.reason(prompt, "visual")
-            
-            if isinstance(imagery_result, dict) and "response" in imagery_result:
-                imagery = imagery_result["response"]
-            elif isinstance(imagery_result, str):
-                imagery = imagery_result
-            else:
-                imagery = f"A simple visual representation of {concept}."
-                
-            return {
-                "success": True,
-                "concept": concept,
-                "mental_imagery": imagery
-            }
-            
-        except Exception as e:
-            return {
-                "error": f"Mental imagery generation failed: {str(e)}",
-                "concept": concept
-            }
-            
-    def detect_visual_anomalies(self, scene_id: str) -> Dict[str, Any]:
-        """
-        Detect unusual or unexpected visual elements in a scene.
-        
-        Args:
-            scene_id: Scene identifier
-            
-        Returns:
-            Detected anomalies
-        """
-        if scene_id not in self.processed_scenes:
-            return {"error": f"Scene {scene_id} not found"}
-            
-        scene = self.processed_scenes[scene_id]
-        
-        try:
-            anomalies = []
-            
-            # Check for unusual object combinations
-            scene_type = scene.global_attributes.get("scene_type", "general")
-            
-            # Define expected objects for scene types
-            expected_objects = {
-                "indoor": ["chair", "table", "couch", "lamp", "book", "tv", "clock"],
-                "nature": ["tree", "plant", "flower", "rock", "grass", "water"],
-                "transportation": ["car", "road", "truck", "bus", "motorcycle", "bicycle"],
-                "social": ["person", "chair", "table", "food", "drink"],
-                "food": ["plate", "food", "table", "bowl", "utensil", "cup"]
-            }
-            
-            # Check for unexpected objects in the scene
-            if scene_type in expected_objects:
-                expected = set(expected_objects[scene_type])
-                
-                for obj_id, obj in scene.objects.items():
-                    if obj.label not in expected:
-                        anomalies.append({
-                            "type": "unexpected_object",
-                            "object_id": obj_id,
-                            "object_label": obj.label,
-                            "confidence": obj.confidence,
-                            "description": f"Unexpected {obj.label} in a {scene_type} scene"
-                        })
-                        
-            # Check for unusual spatial relationships
-            for obj_id, obj in scene.objects.items():
-                for rel in obj.relationships:
-                    rel_type = rel["type"]
-                    target_label = rel["target_label"]
-                    
-                    # Define some unlikely relationships
-                    unlikely_pairs = [
-                        ("person", "inside", "cup"),
-                        ("car", "above", "bird"),
-                        ("book", "contains", "table"),
-                        ("food", "above", "ceiling")
-                    ]
-                    
-                    if any((obj.label, rel_type, target_label) == pair for pair in unlikely_pairs):
-                        anomalies.append({
-                            "type": "unusual_relationship",
-                            "object_label": obj.label,
-                            "relationship": rel_type,
-                            "target_label": target_label,
-                            "confidence": rel["confidence"],
-                            "description": f"Unusual relationship: {obj.label} {rel_type} {target_label}"
-                        })
-                        
-            return {
-                "success": True,
-                "scene_id": scene_id,
-                "anomalies": anomalies,
-                "anomaly_count": len(anomalies)
-            }
-            
-        except Exception as e:
-            return {
-                "error": f"Anomaly detection failed: {str(e)}",
-                "scene_id": scene_id
-            }
-            
-    def save_visual_memory(self, filepath: str) -> Dict[str, Any]:
-        """
-        Save visual memory to file.
-        
-        Args:
-            filepath: Path to save the memory
-            
-        Returns:
-            Save results
-        """
-        try:
-            # Prepare data for saving
-            memory_data = {
-                "scenes": {
-                    scene_id: scene.to_dict() 
-                    for scene_id, scene in self.processed_scenes.items()
-                },
-                "history": self.scene_history,
-                "visual_memory": self.visual_memory
-            }
-            
-            # Save to file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(memory_data, f, indent=2)
-                
-            return {
-                "success": True,
-                "filepath": filepath,
-                "scenes_saved": len(self.processed_scenes)
-            }
-            
-        except Exception as e:
-            return {
-                "error": f"Failed to save visual memory: {str(e)}",
-                "filepath": filepath
-            }
-            
-    def load_visual_memory(self, filepath: str) -> Dict[str, Any]:
-        """
-        Load visual memory from file.
-        
-        Args:
-            filepath: Path to load the memory from
-            
-        Returns:
-            Load results
-        """
-        try:
-            # Check if file exists
-            if not os.path.exists(filepath):
-                return {
-                    "error": f"File not found: {filepath}",
-                    "success": False
-                }
-                
-            # Load from file
-            with open(filepath, 'r', encoding='utf-8') as f:
-                memory_data = json.load(f)
-                
-            # Load scenes
-            loaded_scenes = 0
-            if "scenes" in memory_data:
-                for scene_id, scene_data in memory_data["scenes"].items():
-                    scene = VisualScene.from_dict(scene_data)
-                    self.processed_scenes[scene_id] = scene
-                    loaded_scenes += 1
-                    
-            # Load history
-            if "history" in memory_data:
-                self.scene_history = memory_data["history"]
-                
-            # Load visual memory
-            if "visual_memory" in memory_data:
-                self.visual_memory = memory_data["visual_memory"]
-                
-            return {
-                "success": True,
-                "filepath": filepath,
-                "scenes_loaded": loaded_scenes
-            }
-            
-        except Exception as e:
-            return {
-                "error": f"Failed to load visual memory: {str(e)}",
-                "filepath": filepath
-            }

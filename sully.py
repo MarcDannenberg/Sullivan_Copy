@@ -1041,34 +1041,34 @@ class Sully:
                 self.logger.error(f"Language enhancement error: {str(e)}")
         
         try:
-            if not self.reasoning_node:
-                raise AttributeError("Reasoning node not available")
-                
-            # Attempt standard reasoning with the requested tone
-            result = self.reasoning_node.reason(message, tone)
-            
-            # Apply identity transformation if available
-            if self.identity and hasattr(self.identity, 'align_response'):
-                result = self.identity.align_response(result, tone)
-                
-            # Post-processing hook
-            result = self._execute_hooks("after_reasoning", result)
-            
-            return result
-        except Exception as e:
-            self.logger.error(f"Standard reasoning error with tone '{tone}': {str(e)}")
-            
-            # If specific tone fails, fall back to emergent reasoning
-            if tone != "emergent" and self.reasoning_node:
-                try:
-                    return self.reasoning_node.reason(message, "emergent")
-                except Exception as emergent_e:
-                    self.logger.error(f"Emergent reasoning fallback error: {str(emergent_e)}")
-                    # Even if all reasoning fails, attempt to respond
-                    return f"Contemplating '{message}' leads to new cognitive terrain... {str(e)}"
-            else:
-                # Direct emergent failure
-                return f"Contemplating '{message}' leads to new cognitive terrain... {str(e)}"
+    if not self.reasoning_node:
+        raise AttributeError("Reasoning node not available")
+        
+    # Attempt standard reasoning with the requested tone
+    result = self.reasoning_node.reason(message, tone)
+    
+    # Apply identity transformation if available
+    if self.identity and hasattr(self.identity, 'align_response'):
+        result = self.identity.align_response(result, tone)
+        
+    # Post-processing hook
+    result = self._execute_hooks("after_reasoning", result)
+    
+    return result
+except Exception as e:
+    self.logger.error(f"Standard reasoning error with tone '{tone}': {str(e)}")
+    
+    # If specific tone fails, fall back to emergent reasoning
+    if tone != "emergent" and self.reasoning_node:
+        try:
+            return self.reasoning_node.reason(message, "emergent")
+        except Exception as emergent_e:
+            self.logger.error(f"Emergent reasoning fallback error: {str(emergent_e)}")
+            # Even if all reasoning fails, attempt to respond
+            return f"Contemplating '{message}' leads to new cognitive terrain... {str(e)}"
+    else:
+        # Direct emergent failure
+        return f"Contemplating '{message}' leads to new cognitive terrain... {str(e)}"
 
     def remember(self, message):
         """
